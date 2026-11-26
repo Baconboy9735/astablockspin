@@ -4,12 +4,23 @@ getgenv().BlockSpinFishingConfig = {
     AutoPlay = true,
     AutoSkipTutorial = true,
     AutoSkipAvatar = true,
-    AutoPlayTimeout = 90,
+    AutoPlayTimeout = 300,
+    StartupCheckInterval = 0.35,
+    MovementStuckTime = 0.65,
+    MovementLookAhead = 30,
+    FootRoadDistance = 180,
     BootstrapWithStocker = true,
     StarterBaitAmount = 5,
     StockerWorkTimeout = 45,
     BankStockerPay = true,
     AutoRespawn = true,
+    AutoBuyBike = true,
+    BikePurchaseReserve = 100,
+    AutoPickupDrops = true,
+    LootRadius = 120,
+    LootReserveSlots = 2,
+    RecoverDeathDrops = true,
+    DeathLootExpiry = 180,
     DepositThreshold = 200,
     BaitPerTrip = 50,
     BaitLowWater = 0,
@@ -20,11 +31,10 @@ getgenv().BlockSpinFishingConfig = {
     EnableDeepSea = true,
     DeepSeaAnchor = nil, -- Optional: Vector3.new(X, Y, Z)
     VehicleSpeed = 42,
-    ScooterMinTripDistance = 80,
+    ScooterMinTripDistance = 35,
     ScooterNearbyDistance = 14,
     ScooterCooldownWait = 2,
     ObstaclePollInterval = 0.05,
-    BlockedReactionTime = 0.25,
     VaultDuration = 0.65,
     ObstacleNoclip = true,
     NoclipDuration = 0.25,
@@ -41,7 +51,51 @@ local Config = getgenv().BlockSpinFishingConfig
 -- Withdraws only a purchase shortfall for unlocked rods and bait (user-authorized).
 
 local env = getgenv()
+if env.BlockSpinStartupChecker then env.BlockSpinStartupChecker.Cancelled=true end
 if env.BlockSpinAutoFishing then env.BlockSpinAutoFishing.Destroy() end
+-- Run before game/module/slider initialization: auto-execute can arrive before UI
+-- and its click connections exist. Keep checking as the game builds its screens.
+local startup={Started=os.clock(),Clicks={},Cancelled=false,Completed=false}
+env.BlockSpinStartupChecker=startup
+task.spawn(function()
+    local names={
+        {"AvatarMenuSkipButton","AutoSkipAvatar","CharacterCreator"},
+        {"SlideshowCloseButton","AutoSkipTutorial"},
+        {"PlayButton","AutoPlay","SplashScreenGui"},
+    }
+    local lastClick={}
+    local input=game:GetService("VirtualInputManager")
+    while not startup.Cancelled and os.clock()-startup.Started<Config.AutoPlayTimeout do
+        local p=game:GetService("Players").LocalPlayer
+        local gui=p and p:FindFirstChildOfClass("PlayerGui")
+        if gui and Config.Enabled then
+            for _,entry in ipairs(names) do
+                local scope=gui
+                if entry[3] then scope=gui:FindFirstChild(entry[3],true) end
+                local button=scope and scope:FindFirstChild(entry[1],true)
+                if Config[entry[2]] and button and button:IsA("GuiButton") and button.AbsoluteSize.X>0 and button.AbsoluteSize.Y>0 then
+                    local shown=true
+                    local cursor=button
+                    while cursor and cursor~=gui do
+                        if (cursor:IsA("GuiObject") and not cursor.Visible) or (cursor:IsA("ScreenGui") and not cursor.Enabled) then shown=false break end
+                        cursor=cursor.Parent
+                    end
+                    if shown and os.clock()-(lastClick[entry[1]] or -math.huge)>1.25 then
+                        local point=button.AbsolutePosition+button.AbsoluteSize/2
+                        local ok=pcall(function()
+                            input:SendMouseButtonEvent(point.X,point.Y,0,true,game,0)
+                            input:SendMouseButtonEvent(point.X,point.Y,0,false,game,0)
+                        end)
+                        lastClick[entry[1]]=os.clock()
+                        if ok then startup.Clicks[entry[1]]=(startup.Clicks[entry[1]] or 0)+1 end
+                        break
+                    end
+                end
+            end
+        end
+        task.wait(Config.StartupCheckInterval)
+    end
+end)
 if not game:IsLoaded() then game.Loaded:Wait() end
 assert(game.PlaceId == 104715542330896 or game.PlaceId == 132247642420063, "This script is for the supported BlockSpin places")
 assert(type(filtergc) == "function", "Executor must support filtergc")
@@ -51,31 +105,56 @@ local RS = game:GetService("ReplicatedStorage")
 local RunService = game:GetService("RunService")
 local Pathfinding = game:GetService("PathfindingService")
 local player = Players.LocalPlayer
-local modules = RS.Modules
-local Net = require(modules.Core.Net)
-local Data = require(modules.Core.Data)
-local RodModule = require(modules.Game.ItemTypes.FishingRod)
-local Slider = require(modules.Game.Minigames.SliderMinigame)
-local Items = require(modules.Game.Inventory.ItemUtils)
-local Skills = require(modules.Game.Skills.SkillsList)
-local XP = require(modules.Game.Skills.XPFormula)
-local FishBuyer = require(modules.Game.Fishing.FishBuyerShared)
-local Collection = game:GetService("CollectionService")
-local Unlocks = require(modules.Game.Skills.SkillsList.fishing)
-local Sprint = require(modules.Game.Sprint)
-local Splash = require(modules.Game.SplashScreen)
-local Slideshow = require(modules.Game.UI.Slideshow)
-local CharacterCreator = require(modules.Game.CharacterCreator.CharacterCreator)
-local ShelfStocking = require(modules.Game.Jobs.ShelfStocking)
-local JobApplication = require(modules.Game.Jobs.JobApplicationBeacon)
-local DeathScreen = require(modules.Game.DeathScreen)
-local click = filtergc("function", {Name = "handle_click", Constants = {"minigame_click"}}, true)
-local handlerDeadline=os.clock()+30
-while not click and os.clock()<handlerDeadline do
-    task.wait(0.25)
-    click=filtergc("function",{Name="handle_click",Constants={"minigame_click"}},true)
+while not player do Players:GetPropertyChangedSignal("LocalPlayer"):Wait() player=Players.LocalPlayer end
+-- Let the native game initialize its modules and menu callbacks first. Requiring
+-- Game modules during auto-execute must not race their normal initialization.
+if Config.Enabled then
+    local readySince
+    while not startup.Cancelled do
+        local gui=player:FindFirstChildOfClass("PlayerGui")
+        local splash=gui and gui:FindFirstChild("SplashScreenGui")
+        local creator=gui and gui:FindFirstChild("CharacterCreator")
+        local hud=gui and gui:FindFirstChild("TopRightHud")
+        local menuFinished=(splash and not splash.Enabled) or (not splash and hud and hud.Enabled)
+        local c=player.Character
+        local hum=c and c:FindFirstChildOfClass("Humanoid")
+        startup.Phase="Waiting for native startup UI"
+        if menuFinished and (not creator or not creator.Enabled) and hum and hum.Health>0 then
+            readySince=readySince or os.clock()
+            if os.clock()-readySince>=1 then startup.Phase="Native UI ready" break end
+        else readySince=nil end
+        if os.clock()-startup.Started>Config.AutoPlayTimeout then
+            startup.Cancelled=true
+            error("Startup UI did not finish loading; check BlockSpinStartupChecker before rerunning")
+        end
+        task.wait(0.2)
+    end
+    if startup.Cancelled then return end
 end
-assert(type(click) == "function", "Game slider handler not found; game may have changed")
+local modules = RS:WaitForChild("Modules")
+local function loadModule(path)
+    local object=modules
+    for name in string.gmatch(path,"[^.]+") do object=object:WaitForChild(name) end
+    return require(object)
+end
+local Net = loadModule("Core.Net")
+local Data = loadModule("Core.Data")
+local RodModule = loadModule("Game.ItemTypes.FishingRod")
+local Slider = loadModule("Game.Minigames.SliderMinigame")
+local Items = loadModule("Game.Inventory.ItemUtils")
+local Skills = loadModule("Game.Skills.SkillsList")
+local XP = loadModule("Game.Skills.XPFormula")
+local FishBuyer = loadModule("Game.Fishing.FishBuyerShared")
+local Collection = game:GetService("CollectionService")
+local Unlocks = loadModule("Game.Skills.SkillsList.fishing")
+local Sprint = loadModule("Game.Sprint")
+local Splash = loadModule("Game.SplashScreen")
+local Slideshow = loadModule("Game.UI.Slideshow")
+local CharacterCreator = loadModule("Game.CharacterCreator.CharacterCreator")
+local ShelfStocking = loadModule("Game.Jobs.ShelfStocking")
+local JobApplication = loadModule("Game.Jobs.JobApplicationBeacon")
+local DeathScreen = loadModule("Game.DeathScreen")
+local click
 
 local API = {
     Running = false, Status = "Ready", Catches = 0, Config = Config,
@@ -92,6 +171,25 @@ local dataHooks = {}
 local lastClick, pendingLevel, pendingAt = 0, nil, 0
 local activeRod, ownedCast, sessionId = nil, false, nil
 local driveCleanup
+local previousDeath=env.BlockSpinDeathRecovery
+if previousDeath and previousDeath.JobId==game.JobId and os.time()-previousDeath.Time<Config.DeathLootExpiry then
+    API.DeathRecovery=previousDeath
+end
+local function watchDeath(c)
+    task.spawn(function()
+        local hum=c:WaitForChild("Humanoid",10)
+        if not hum or destroyed then return end
+        connections[#connections+1]=hum.Died:Connect(function()
+            local root=c:FindFirstChild("HumanoidRootPart")
+            if not root then return end
+            local record={Position=root.Position,Time=os.time(),JobId=game.JobId}
+            API.DeathRecovery=record
+            env.BlockSpinDeathRecovery=record
+        end)
+    end)
+end
+connections[#connections+1]=player.CharacterAdded:Connect(watchDeath)
+if player.Character then watchDeath(player.Character) end
 
 -- Keep the normal Net API, including its shared sequence counters and game environment.
 local netGet = setfenv(function(...) return Net.get(...) end, getfenv(Net.get))
@@ -191,7 +289,6 @@ local function pressGameButton(button)
     local signal=button.MouseButton1Click
     local listeners=getconnections(signal)
     if #listeners==0 then signal=button.Activated listeners=getconnections(signal) end
-    if #listeners==0 then return false end
     local point=button.AbsolutePosition+button.AbsoluteSize/2
     local physical=pcall(function()
         local input=game:GetService("VirtualInputManager")
@@ -225,6 +322,7 @@ local function enterGame(token)
             readySince=readySince or os.clock()
             if os.clock()-readySince>=0.6 then
                 API.AutoPlayCompleted=true
+                startup.Completed=true
                 return true
             end
         else
@@ -255,7 +353,7 @@ local function enterGame(token)
             elseif Splash.in_loading_screen.get() then
                 status("Waiting for Play / entering the game")
                 local screen=playerGui:FindFirstChild("SplashScreenGui")
-                if screen and screen.Enabled and not playerGui:FindFirstChild("LoadingScreen") and os.clock()-lastPlay>=1.5 then
+                if screen and screen.Enabled and os.clock()-lastPlay>=1.5 then
                     local button=screen:FindFirstChild("PlayButton",true)
                     if pressGameButton(button) then
                         lastPlay=os.clock()
@@ -439,137 +537,165 @@ local function walkToSpot(token, destination, caption)
     sensing.FilterType=Enum.RaycastFilterType.Exclude
     sensing.FilterDescendantsInstances={c}
     sensing.RespectCanCollide=true
-    local function reactAhead(direction)
-        if h.SeatPart then
-            h.Sit=false
-            h:ChangeState(Enum.HumanoidStateType.GettingUp)
-        end
-        local lookAhead=math.clamp(h.WalkSpeed*0.22,4,7)
-        local hit=workspace:Raycast(root.Position-Vector3.new(0,1.8,0),direction*lookAhead,sensing)
-            or workspace:Raycast(root.Position,direction*lookAhead,sensing)
-        if not hit or hit.Normal.Y>0.65 then return false end
-        local detected=os.clock()
-        if hit.Instance.Name=="DoorBase" then return false end
-        local crossed=vaultShortObstacle(direction)
-        if crossed then API.LastObstacleResponseTime=os.clock()-detected end
-        return crossed
+    local function floorAt(point)
+        local floor=workspace:Raycast(point+Vector3.new(0,4,0),Vector3.new(0,-18,0),sensing)
+        if floor and floor.Material~=Enum.Material.Water and floor.Normal.Y>0.6 then return floor end
     end
-    local function steerOnGround()
-        local params = RaycastParams.new()
-        params.FilterType = Enum.RaycastFilterType.Exclude
-        params.FilterDescendantsInstances = {c}
-        params.RespectCanCollide = true
-        local stalls = 0
-        local visits,previousDirection={},nil
-        local function cell(point)
-            return tostring(math.floor(point.X/8))..":"..tostring(math.floor(point.Z/8))
+    local function clearSegment(target)
+        local delta=Vector3.new(target.X-root.Position.X,0,target.Z-root.Position.Z)
+        if delta.Magnitude<0.1 then return true end
+        local side=Vector3.new(-delta.Z,0,delta.X).Unit*1.3
+        for _,offset in ipairs({Vector3.zero,side,-side}) do
+            if workspace:Raycast(root.Position+offset,delta,sensing)
+                or workspace:Raycast(root.Position+offset-Vector3.new(0,1.7,0),delta,sensing) then return false end
         end
-        local deadline = os.clock()+math.max(60,horizontal(root.Position,destination)/math.max(h.WalkSpeed,1)*3)
-        while alive(token) and (horizontal(root.Position,destination)>4 or math.abs(root.Position.Y-destination.Y)>7) and os.clock()<deadline do
-            local steeringDestination=destination
-            if horizontal(root.Position,destination)<8 and root.Position.Y>destination.Y+7 then steeringDestination=destination+Vector3.new(45,0,0) end
-            local delta = Vector3.new(steeringDestination.X-root.Position.X,0,steeringDestination.Z-root.Position.Z)
-            if delta.Magnitude<0.1 then return false end
-            local direction = delta.Unit
-            local origin = root.Position
-            visits[cell(origin)]=(visits[cell(origin)] or 0)+1
-            if reactAhead(direction) then stalls=0 continue end
-            local best,bestScore,bestDirection
-            -- Remember visited cells and allow temporary movement away from the goal.
-            for _,degrees in ipairs({0,35,-35,70,-70,100,-100,135,-135,180}) do
-                local angle=math.rad(degrees)
-                local rotated=Vector3.new(direction.X*math.cos(angle)-direction.Z*math.sin(angle),0,direction.X*math.sin(angle)+direction.Z*math.cos(angle))
-                local point=origin+rotated*math.min(12,delta.Magnitude)
-                local ground=workspace:Raycast(point+Vector3.new(0,4,0),Vector3.new(0,-25,0),params)
-                if ground and ground.Material~=Enum.Material.Water and ground.Normal.Y>0.6 then
-                    local obstruction=workspace:Raycast(origin,rotated*math.min(10,delta.Magnitude),params)
-                    if not obstruction and ground.Position.Y<=origin.Y+2 then
-                        local score=horizontal(ground.Position,steeringDestination)
-                            +(visits[cell(ground.Position)] or 0)*24
-                            -(previousDirection and previousDirection:Dot(rotated)*3 or 0)
-                        if not bestScore or score<bestScore then
-                            best,bestScore,bestDirection=ground.Position,score,rotated
-                        end
+        local previousY=root.Position.Y-h.HipHeight-root.Size.Y/2
+        for distance=math.min(5,delta.Magnitude),delta.Magnitude+0.1,5 do
+            local floor=floorAt(root.Position+delta.Unit*distance)
+            if not floor or math.abs(floor.Position.Y-previousY)>5 then return false end
+            previousY=floor.Position.Y
+        end
+        local floor=floorAt(Vector3.new(target.X,root.Position.Y,target.Z))
+        return floor~=nil and math.abs(floor.Position.Y-previousY)<5
+    end
+    local function reached(target,tolerance)
+        return horizontal(root.Position,target)<(tolerance or 3) and math.abs(root.Position.Y-target.Y)<7
+    end
+    local function follow(target,timeout,invalidated)
+        local deadline=os.clock()+timeout
+        local progressPosition,progressAt=root.Position,os.clock()
+        local started=root.Position
+        local recoveries=0
+        h:MoveTo(target)
+        while alive(token) and h.Health>0 and root.Parent and os.clock()<deadline do
+            if reached(target,3) then return true end
+            -- Advance smoothly when crossing a waypoint instead of turning back to it.
+            local fromStart=Vector3.new(target.X-started.X,0,target.Z-started.Z)
+            local remaining=Vector3.new(target.X-root.Position.X,0,target.Z-root.Position.Z)
+            if remaining.Magnitude<5 and fromStart:Dot(remaining)<0 then return true end
+            if invalidated and invalidated() then return false end
+            if h.SeatPart then h.Sit=false h:ChangeState(Enum.HumanoidStateType.GettingUp) end
+            if horizontal(root.Position,progressPosition)>1 then
+                progressPosition,progressAt=root.Position,os.clock()
+            elseif os.clock()-progressAt>=Config.MovementStuckTime then
+                local direction=remaining.Magnitude>0.1 and remaining.Unit or nil
+                local hit=direction and workspace:Raycast(root.Position,direction*6,sensing)
+                local recovered=false
+                -- Touch-operated doors need a little time before obstacle recovery.
+                if hit and hit.Instance.Name=="DoorBase" and os.clock()-progressAt<1.4 then
+                    h:MoveTo(target)
+                else
+                    API.StuckRecoveries=(API.StuckRecoveries or 0)+1
+                    if direction then recovered=vaultShortObstacle(direction) end
+                    -- Recovery can land beyond the old waypoint. Replan there instead
+                    -- of walking backwards into the obstacle to reach that waypoint.
+                    if recovered then API.LastObstacleResponseTime=os.clock()-progressAt return false end
+                    if not recovered then jumpObstacle() end
+                    recoveries+=1
+                    if recoveries>=2 then return false end
+                    progressPosition,progressAt=root.Position,os.clock()
+                    h:MoveTo(target)
+                end
+            end
+            task.wait(Config.ObstaclePollInterval)
+        end
+        return reached(target,4)
+    end
+    local visits={}
+    local function cell(point)
+        return tostring(math.floor(point.X/8))..":"..tostring(math.floor(point.Z/8))
+    end
+    local function detour()
+        local origin=root.Position
+        visits[cell(origin)]=(visits[cell(origin)] or 0)+1
+        local delta=Vector3.new(destination.X-origin.X,0,destination.Z-origin.Z)
+        if delta.Magnitude<0.1 then return false end
+        local best,score
+        for _,degrees in ipairs({0,35,-35,70,-70,110,-110,150,-150,180}) do
+            local angle=math.rad(degrees)
+            local d=delta.Unit
+            local direction=Vector3.new(d.X*math.cos(angle)-d.Z*math.sin(angle),0,d.X*math.sin(angle)+d.Z*math.cos(angle))
+            local point=origin+direction*10
+            local floor=floorAt(point)
+            if floor and math.abs(floor.Position.Y-origin.Y)<8 and clearSegment(point) then
+                local candidate=horizontal(point,destination)+(visits[cell(point)] or 0)*30
+                if not score or candidate<score then best,score=floor.Position,candidate end
+            end
+        end
+        if best then return follow(best,2.5) end
+        local recovered=vaultShortObstacle(delta.Unit)
+        return recovered
+    end
+    local travelDeadline=os.clock()+math.max(45,horizontal(root.Position,destination)/math.max(h.WalkSpeed,1)*3+20)
+    local failedPlans,totalPlans=0,0
+    local bestDistance,bestAt=horizontal(root.Position,destination),os.clock()
+    API.MovementGoal=tostring(destination)
+    while alive(token) and h.Health>0 and root.Parent and os.clock()<travelDeadline do
+        if reached(destination,4) then API.MovementMode="Arrived" return true end
+        local currentDistance=horizontal(root.Position,destination)
+        if currentDistance<bestDistance-5 then bestDistance,bestAt=currentDistance,os.clock() end
+        if os.clock()-bestAt>12 or totalPlans>=12 then break end
+        local delta=Vector3.new(destination.X-root.Position.X,0,destination.Z-root.Position.Z)
+        if delta.Magnitude<0.1 then break end
+        local range=math.min(math.clamp(Config.MovementLookAhead,10,40),delta.Magnitude)
+        local direct=root.Position+delta.Unit*range
+        if delta.Magnitude<=range then direct=destination end
+        if clearSegment(direct) then
+            API.MovementMode="Direct"
+            if follow(direct,range/math.max(h.WalkSpeed,1)+2) then failedPlans=0 continue end
+        end
+        if not alive(token) or h.Health<=0 then return false end
+        API.MovementMode="Planning"
+        totalPlans+=1
+        API.MovementReplans=(API.MovementReplans or 0)+1
+        player:RequestStreamAroundAsync(root.Position+delta.Unit*math.min(100,delta.Magnitude),1)
+        local path=Pathfinding:CreatePath({AgentRadius=2,AgentHeight=5,AgentCanJump=true,WaypointSpacing=6,Costs={Water=100000}})
+        local computed=pcall(function() path:ComputeAsync(root.Position,destination) end)
+        if not alive(token) then return false end
+        local advanced=false
+        if computed and path.Status==Enum.PathStatus.Success then
+            API.MovementMode="Following path"
+            local points=path:GetWaypoints()
+            local index=1
+            local dirty=false
+            local blockedConnection=path.Blocked:Connect(function(blockedIndex)
+                if blockedIndex>=index then dirty=true end
+            end)
+            local ok=pcall(function()
+                while index<=#points and alive(token) and not dirty do
+                    while index<#points and reached(points[index].Position,3) do index+=1 end
+                    local chosen=index
+                    for nextIndex=index+1,math.min(index+7,#points) do
+                        local point=points[nextIndex]
+                        if point.Action==Enum.PathWaypointAction.Jump or horizontal(root.Position,point.Position)>Config.MovementLookAhead
+                            or not clearSegment(point.Position) then break end
+                        chosen=nextIndex
                     end
+                    index=chosen
+                    local point=points[index]
+                    if point.Action==Enum.PathWaypointAction.Jump then h.Jump=true end
+                    local limit=horizontal(root.Position,point.Position)/math.max(h.WalkSpeed,1)+2
+                    if not follow(point.Position,limit,function()return dirty end) then break end
+                    advanced=true
+                    index+=1
                 end
-            end
-            if not best then
-                jumpObstacle()
-                best=origin+direction*5
-            end
-            previousDirection=bestDirection
-            h:MoveTo(best)
-            local untilTime=os.clock()+math.max(0.6,horizontal(root.Position,best)/math.max(h.WalkSpeed,1)+0.3)
-            local progressPosition,progressAt=root.Position,os.clock()
-            repeat
-                if not alive(token) or h.Health<=0 then return false end
-                local toward=Vector3.new(best.X-root.Position.X,0,best.Z-root.Position.Z)
-                if toward.Magnitude>0.1 and reactAhead(toward.Unit) then break end
-                if horizontal(root.Position,progressPosition)>0.5 then progressPosition,progressAt=root.Position,os.clock() end
-                if os.clock()-progressAt>Config.BlockedReactionTime then
-                    jumpObstacle()
-                    vaultShortObstacle(direction)
-                    break
-                end
-                task.wait(Config.ObstaclePollInterval)
-            until horizontal(root.Position,best)<3 or os.clock()>untilTime
-            if horizontal(root.Position,destination) >= horizontal(origin,destination)-1 then
-                stalls+=1
-                jumpObstacle()
-                if stalls>=1 then vaultShortObstacle(direction) end
-                if stalls>24 then return false end
-            else
-                stalls=0
-            end
+            end)
+            blockedConnection:Disconnect()
+            if not ok then advanced=false end
         end
-        return horizontal(root.Position,destination)<4 and math.abs(root.Position.Y-destination.Y)<7
+        if reached(destination,4) then API.MovementMode="Arrived" return true end
+        if advanced then failedPlans=0 else failedPlans+=1 end
+        if not advanced then
+            API.MovementMode="Local recovery"
+            if detour() then failedPlans=0 end
+        end
+        if failedPlans>=6 then break end
+        task.wait(0.05)
     end
-    for attempt = 1, 4 do
-        if not alive(token) then return false end
-        player:RequestStreamAroundAsync(destination, 3)
-        local path = Pathfinding:CreatePath({AgentRadius=2, AgentHeight=5, AgentCanJump=true,
-            WaypointSpacing=5, Costs={Water=100000}})
-        local computed = pcall(function() path:ComputeAsync(root.Position, destination) end)
-        if not alive(token) then return false end
-        if not computed or path.Status ~= Enum.PathStatus.Success then
-            if h:GetState() == Enum.HumanoidStateType.Swimming then
-                h:MoveTo(destination)
-                h.Jump = true
-                local untilTime = os.clock() + 10
-                repeat task.wait(0.2) until not alive(token) or os.clock()>untilTime or h:GetState()~=Enum.HumanoidStateType.Swimming
-                continue
-            end
-            if steerOnGround() then return true end
-            return false, "Walking route blocked; move around the obstruction and restart"
-        end
-        local blocked = false
-        for _, point in ipairs(path:GetWaypoints()) do
-            if not alive(token) or not root.Parent or h.Health<=0 then return false end
-            if point.Action == Enum.PathWaypointAction.Jump then h.Jump = true end
-            h:MoveTo(point.Position)
-            local deadline = os.clock() + math.max(1.2, horizontal(root.Position,point.Position)/math.max(h.WalkSpeed,1)+0.8)
-            local progressPosition,progressAt=root.Position,os.clock()
-            while horizontal(root.Position,point.Position)>2.8 do
-                if not alive(token) or h.Health<=0 then return false end
-                local toward=Vector3.new(point.Position.X-root.Position.X,0,point.Position.Z-root.Position.Z)
-                if toward.Magnitude>0.1 and reactAhead(toward.Unit) then blocked=true break end
-                if horizontal(root.Position,progressPosition)>0.5 then progressPosition,progressAt=root.Position,os.clock() end
-                if os.clock()-progressAt>Config.BlockedReactionTime then
-                    if toward.Magnitude>0.1 then vaultShortObstacle(toward.Unit) end
-                    blocked=true
-                    break
-                end
-                if os.clock()>deadline then blocked=true break end
-                task.wait(Config.ObstaclePollInterval)
-            end
-            if blocked then break end
-        end
-        if horizontal(root.Position,destination)<4 and math.abs(root.Position.Y-destination.Y)<7 then return true end
-        -- Recompute from the current position before using the local detour.
-        if blocked and attempt==4 then return steerOnGround(),"Ground detour blocked" end
-    end
-    return false, "Walking route blocked; move around the obstruction and restart"
+    API.MovementMode="Blocked"
+    return false,"Could not find a clear route after replanning"
 end
+
 
 local walkingRoute = walkToSpot
 -- Road junctions observed during the original script's travel, plus map pier approaches.
@@ -609,21 +735,51 @@ local function roadRoute(origin,destination)
     local route={roads[finish]}
     local cursor=finish
     while previous[cursor] do cursor=previous[cursor] table.insert(route,1,roads[cursor]) end
-    return route
+    local params=RaycastParams.new()
+    params.FilterType=Enum.RaycastFilterType.Exclude
+    params.FilterDescendantsInstances={player.Character,workspace.Vehicles}
+    params.RespectCanCollide=true
+    local function clearStreet(a,b)
+        local from=Vector3.new(a.X,255.2,a.Z)
+        local delta=Vector3.new(b.X-a.X,0,b.Z-a.Z)
+        if delta.Magnitude<0.1 then return true end
+        local side=Vector3.new(-delta.Z,0,delta.X).Unit*1.5
+        for _,offset in ipairs({Vector3.zero,side,-side}) do
+            if workspace:Raycast(from+offset,delta,params)
+                or workspace:Raycast(from+offset-Vector3.new(0,1.7,0),delta,params) then return false end
+        end
+        return true
+    end
+    local expanded={}
+    local from=origin
+    for _,point in ipairs(route) do
+        -- Diagonal junction links can cut across the inside of a city block.
+        -- Use a clear right-angle corner when the direct street link hits a wall.
+        if math.abs(point.X-from.X)>15 and math.abs(point.Z-from.Z)>15 and not clearStreet(from,point) then
+            for _,corner in ipairs({Vector3.new(from.X,251,point.Z),Vector3.new(point.X,251,from.Z)}) do
+                if clearStreet(from,corner) and clearStreet(corner,point) then table.insert(expanded,corner) break end
+            end
+        end
+        table.insert(expanded,point)
+        from=point
+    end
+    return expanded
 end
 local function tryOwnedTransport(token, destination)
     local c,h,root=character()
     if not root or (root.Position-destination).Magnitude<Config.ScooterMinTripDistance or type(fireproximityprompt)~="function" then return false end
     local owned
     Items.iterate_through_items_of_type(Data,"bike",function(item)
-        if item.location=="hand" and item.name=="EScooter" and not item.destroyed and (item.health or 1)>0 then owned=item end
+        if item.location=="hand" and (item.name=="EScooter" or item.name=="BMX") and not item.destroyed and (item.health or 1)>0 then
+            if not owned or item.name=="EScooter" then owned=item end
+        end
     end)
     if not owned then return false end
-    API.Transport="EScooter"
-    status("Using inventory EScooter")
+    API.Transport=owned.name
+    status("Using inventory "..owned.name)
     local function findScooter()
         for _,v in ipairs(workspace.Vehicles:GetChildren()) do
-            if v.Name=="EScooter" and v:GetAttribute("OwnerUserId")==player.UserId then return v end
+            if v.Name==owned.name and v:GetAttribute("OwnerUserId")==player.UserId then return v end
         end
     end
     local function awaitVehicleState(predicate,timeout)
@@ -813,6 +969,18 @@ walkToSpot = function(token,destination,caption)
         end
         if tryOwnedTransport(token,destination) then return true end
         API.Transport="Running"
+        local _,_,roadRoot=character()
+        if roadRoot and (roadRoot.Position-destination).Magnitude>Config.FootRoadDistance then
+            local route=roadRoute(roadRoot.Position,destination)
+            for _,junction in ipairs(route) do
+                if not alive(token) then return false end
+                local target=Vector3.new(junction.X,255.2,junction.Z)
+                if (roadRoot.Position-target).Magnitude>8 then
+                    local arrived=walkingRoute(token,target,"Running along city streets")
+                    if not arrived then return false,"Street approach blocked" end
+                end
+            end
+        end
         return walkingRoute(token,destination,caption)
     end)
     API.Travelling = false
@@ -952,6 +1120,150 @@ local function deposit(token)
     if cash() >= Config.DepositThreshold then return transfer(token, "hand", "bank", cash()) end
     return true
 end
+local lootRetry=setmetatable({},{__mode="k"})
+local function dropPosition(drop)
+    local zone=drop:FindFirstChild("PickUpZone")
+    if zone and zone:IsA("BasePart") then return zone.Position end
+    if drop:IsA("Model") then return drop:GetPivot().Position end
+    if drop:IsA("BasePart") then return drop.Position end
+end
+local function collectDrops(token,center,radius)
+    if not Config.AutoPickupDrops or player:GetAttribute("IsInPassiveMode") then return true end
+    local folder=workspace:FindFirstChild("DroppedItems")
+    if not folder then return true end
+    local picked=0
+    local deadline=os.clock()+40
+    while alive(token) and picked<12 and os.clock()<deadline do
+        local _,hum,root=character()
+        if not root or not hum or hum.Health<=0 then return false end
+        local target,position,distance
+        for _,drop in ipairs(folder:GetChildren()) do
+            if drop:GetAttribute("Locked")~=true and os.clock()-(lootRetry[drop] or -math.huge)>30 then
+                local p=dropPosition(drop)
+                local isMoney=drop:GetAttribute("item_type")=="money"
+                local enoughSpace=isMoney or (not inventoryFull() and Items.get_inventory_count(Data).hand<capacity-Config.LootReserveSlots)
+                if p and enoughSpace and (p-center).Magnitude<=radius then
+                    local delta=(root.Position-p).Magnitude
+                    if not distance or delta<distance then target,position,distance=drop,p,delta end
+                end
+            end
+        end
+        if not target then break end
+        lootRetry[target]=os.clock()
+        local beforeCount=Items.get_inventory_count(Data).hand
+        local beforeMoney=cash()+bank()
+        local _,h=character()
+        if h then h:UnequipTools() end
+        local reached=walkToSpot(token,position,"Collecting dropped "..target.Name)
+        if not alive(token) then return false end
+        local accepted,reason
+        if target.Parent and reached then accepted,reason=netGet("pickup_dropped_item",target) end
+        API.LastLootReply={Accepted=accepted,Reason=reason,Item=target.Name}
+        local confirmed=waitFor(token,function()
+            return Items.get_inventory_count(Data).hand>beforeCount or cash()+bank()>beforeMoney
+        end,accepted and 3 or 0.3)
+        if confirmed then API.DropsCollected=(API.DropsCollected or 0)+1 end
+        picked+=1
+        if reason=="NoSpace" then break end
+    end
+    return alive(token)
+end
+local function recoverDeathDrops(token)
+    local record=API.DeathRecovery
+    if not record then return true end
+    if not Config.RecoverDeathDrops or not Config.AutoPickupDrops or record.JobId~=game.JobId
+        or os.time()-record.Time>Config.DeathLootExpiry then
+        API.DeathRecovery=nil
+        env.BlockSpinDeathRecovery=nil
+        return true
+    end
+    status("Returning to recover death drops")
+    player:RequestStreamAroundAsync(record.Position,5)
+    if not alive(token) then return false end
+    local recoveryOK=walkToSpot(token,record.Position,"Returning to death location")
+    if not alive(token) then return false end
+    if recoveryOK then
+        -- Newly dropped items can remain locked briefly; respect that lock.
+        waitFor(token,function()
+            local folder=workspace:FindFirstChild("DroppedItems")
+            if not folder then return true end
+            for _,drop in ipairs(folder:GetChildren()) do
+                local p=dropPosition(drop)
+                if p and (p-record.Position).Magnitude<35 and drop:GetAttribute("Locked")==true then return false end
+            end
+            return true
+        end,5)
+        if not alive(token) then return false end
+        if not collectDrops(token,record.Position,35) then return false end
+        API.DeathRecoveries=(API.DeathRecoveries or 0)+1
+    else
+        API.LastWarning="Could not reach death drops; resuming normal work"
+    end
+    -- Keep a newer death record if another death occurred during recovery.
+    if API.DeathRecovery==record then API.DeathRecovery=nil env.BlockSpinDeathRecovery=nil end
+    return alive(token)
+end
+local function ownedTravelBike()
+    local found
+    Items.iterate_through_items_of_type(Data,"bike",function(item)
+        if item.location=="hand" and (item.name=="EScooter" or item.name=="BMX")
+            and not item.destroyed and (item.health or 1)>0 then found=item end
+    end)
+    return found
+end
+local function ensureBike(token)
+    if not Config.AutoBuyBike or ownedTravelBike() then return true end
+    if os.clock()-(API.LastBikePurchaseAttempt or -math.huge)<60 then return true end
+    -- The cheapest basic cash case yields either BMX or EScooter.
+    if cash()+bank()<1100+Config.BikePurchaseReserve then
+        API.BikePurchaseStatus="Saving for basic bike case"
+        return true
+    end
+    player:RequestStreamAroundAsync(Vector3.new(235.03,254.20,-252.75),4)
+    if not alive(token) then return false end
+    local tile=workspace.Map.Tiles:FindFirstChild("BurgerPlaceTile")
+    local shop=tile and tile:FindFirstChild("UrbanCyclesAndSkates")
+    local interior=shop and shop:FindFirstChild("Interior")
+    local crates=interior and interior:FindFirstChild("Crates")
+    local crate=crates and crates:FindFirstChild("Bike Crate")
+    local options=crate and crate:FindFirstChild("CrateOptions")
+    local chosen,price
+    if options then
+        for _,option in ipairs(options:GetChildren()) do
+            if option:IsA("ModuleScript") and option:GetAttribute("disabled")~=true then
+                local ok,definition=pcall(require,option)
+                local cost=option:GetAttribute("price")
+                if ok and type(cost)=="number" and cost>0 and (not definition.purchase_type or definition.purchase_type=="money") then
+                    local valid=#(definition.items or {})>0
+                    for _,item in ipairs(definition.items or {}) do
+                        if item.item_type~="bike" or (item.name~="BMX" and item.name~="EScooter") then valid=false end
+                    end
+                    if valid and (not price or cost<price) then chosen,price=option,cost end
+                end
+            end
+        end
+    end
+    if not chosen or cash()+bank()<price+Config.BikePurchaseReserve or inventoryFull() then return true end
+    if cash()<price and not Config.AllowPurchaseWithdrawals then return true end
+    API.LastBikePurchaseAttempt=os.clock()
+    if cash()<price and not transfer(token,"bank","hand",price-cash()) then return false end
+    local outside=Vector3.new(250.91,255.2,-225)
+    local inside=Vector3.new(250.91,255.2,-245)
+    if not moveTo(token,outside,"Travelling to bike shop") then return false end
+    if not moveTo(token,inside,"Entering bike shop") then return false end
+    if not moveTo(token,crate:GetPivot().Position,"Buying basic bike case") then return false end
+    local accepted,reason=netGet("open_crate",chosen,"money")
+    API.LastBikePurchaseReply={Accepted=accepted~=false and accepted~=nil,Reason=reason,Price=price}
+    if accepted then
+        if waitFor(token,function()return ownedTravelBike()~=nil end,8) then
+            API.BikesPurchased=(API.BikesPurchased or 0)+1
+            API.BikePurchaseStatus="Owned: "..ownedTravelBike().name
+        else API.LastWarning="Bike purchase was accepted but inventory confirmation is pending" end
+    else API.BikePurchaseStatus="Purchase rejected: "..tostring(reason) end
+    if not alive(token) then return false end
+    if not moveTo(token,inside,"Leaving bike shop") then return false end
+    return moveTo(token,outside,"Exiting bike shop")
+end
 -- The mainland buyer is indoors; enter through the south double door.
 local buyerOutside=Vector3.new(-271.01,255.2,430)
 local buyerInside=Vector3.new(-271.01,255.2,402)
@@ -982,6 +1294,10 @@ local function approachFishBuyer(token,position)
     local p=root.Position
     local inside=p.X>-288 and p.X<-236 and p.Z>330 and p.Z<412
     if not inside then
+        if (p-position).Magnitude>150 then
+            if not moveTo(token,Vector3.new(-294,255.2,430),"Travelling to fish shop street entrance") then return false end
+            p=root.Position
+        end
         if p.Z<428 then
             local side=p.X>-236 and -219 or -294
             if not moveTo(token,Vector3.new(side,255.2,p.Z),"Following fish shop exterior") then return false end
@@ -1353,7 +1669,7 @@ local function earnStarterFunds(token,target)
         -- Touching the assigned shelf runs the native timed stocking interaction.
         status("Stocking shelf for fishing equipment")
         hum:MoveTo(Vector3.new(shelf.Position.X,root.Position.Y,shelf.Position.Z))
-        local progress=require(modules.Game.UI.ProgressBar)
+        local progress=loadModule("Game.UI.ProgressBar")
         local began=waitFor(token,function()return progress.bar_enabled.get() or cash()+bank()>before end,2)
         if not alive(token) then return false end
         if not began and jobBox() and (root.Position-shelf.Position).Magnitude<9 then
@@ -1471,7 +1787,9 @@ local function prepareEquipment(token)
     local ammo = Items.get_item_ammo_type(desiredBait)
     if baitAmount(ammo) <= Config.BaitLowWater and not inventoryFull() then
         local price = Items.get_item_rarity_price(desiredBait)
-        local quantity = math.min(Config.BaitPerTrip - baitAmount(ammo), math.floor((cash() + bank()) / price), 50)
+        local tripAmount=Config.BaitPerTrip
+        if Config.AutoBuyBike and not ownedTravelBike() then tripAmount=math.min(tripAmount,5) end
+        local quantity = math.min(tripAmount - baitAmount(ammo), math.floor((cash() + bank()) / price), 50)
         if quantity > 0 then
             local before = baitAmount(ammo)
             if not purchase(token, desiredBait, quantity, price * quantity) then return false end
@@ -1516,6 +1834,11 @@ API.Snapshot = function()
         DeepSeaAvailable=API.DeepSeaAvailable,Spot=tostring(API.Spot),Water=tostring(API.Water),
         ObstacleFlights=API.ObstacleFlights or 0,LastVaultDuration=API.LastVaultDuration,
         NoclipPasses=API.NoclipPasses or 0,NoclipActive=API.NoclipActive or false,
+        MovementMode=API.MovementMode,MovementGoal=API.MovementGoal,
+        MovementReplans=API.MovementReplans or 0,StuckRecoveries=API.StuckRecoveries or 0,
+        StartupClicks=startup.Clicks,StartupCompleted=startup.Completed,
+        DropsCollected=API.DropsCollected or 0,DeathRecoveries=API.DeathRecoveries or 0,
+        DeathLootPending=API.DeathRecovery~=nil,BikesPurchased=API.BikesPurchased or 0,BikePurchaseStatus=API.BikePurchaseStatus,
         TransportTrips=API.TransportTrips or 0,TransportError=API.LastTransportError,
         ScooterRefreshes=API.ScooterRefreshes or 0,ScooterSpawnDistance=API.LastScooterSpawnDistance,
         VehicleReply=API.LastVehicleReply,ObstaclePollInterval=Config.ObstaclePollInterval,
@@ -1598,6 +1921,15 @@ function API.Start()
     task.spawn(function()
         local ok, err = pcall(function()
             if not enterGame(token) then return end
+            local handlerDeadline=os.clock()+60
+            repeat
+                click=filtergc("function",{Name="handle_click",Constants={"minigame_click"}},true)
+                if click then break end
+                status("Waiting for fishing input to initialize")
+                task.wait(0.25)
+            until not alive(token) or os.clock()>handlerDeadline
+            if not alive(token) then return end
+            if type(click)~="function" then error("Fishing input did not initialize after startup") end
             -- Unequipping runs the game's own cancellation path for any previous script's cast.
             local _,initialHumanoid=character()
             if initialHumanoid then initialHumanoid:UnequipTools() task.wait(0.3) end
@@ -1619,6 +1951,12 @@ function API.Start()
                     continue
                 end
                 updateProgress()
+                if not recoverDeathDrops(token) then return end
+                if Config.AutoPickupDrops then
+                    local _,_,lootRoot=character()
+                    if lootRoot and not collectDrops(token,lootRoot.Position,Config.LootRadius) then return end
+                    if not deposit(token) then return end
+                end
                 if not ensureStarterRod(token) then return end
                 selectZone()
                 if inventoryFull() or API.SellRequested then
@@ -1626,6 +1964,7 @@ function API.Start()
                     if fishCount()>0 then if not sellFish(token) then return end
                     elseif inventoryFull() then error("Inventory full of non-fish items") end
                 end
+                if not ensureBike(token) then return end
                 if not alive(token) or not prepareEquipment(token) then return end
                 if inventoryFull() then continue end
                 if (root.Position - API.Spot).Magnitude > 10 then
@@ -1707,6 +2046,7 @@ function API.Start()
     end)
 end
 function API.Destroy()
+    startup.Cancelled=true
     API.Stop("Closed")
     destroyed = true
     for _, c in ipairs(connections) do c:Disconnect() end
