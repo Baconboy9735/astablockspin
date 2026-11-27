@@ -23,6 +23,8 @@ getgenv().BlockSpinFishingConfig = {
     RetryDelay = 5,
     MaxRetryDelay = 30,
     StockerWorkTimeout = 45,
+    StockerArrivalDistance = 2.2,
+    StockerBlockedTime = 0.65,
     BankStockerPay = true,
     AutoRespawn = true,
     AntiKill = true,
@@ -49,9 +51,13 @@ getgenv().BlockSpinFishingConfig = {
     EnableDeepSea = true,
     DeepSeaAnchor = nil, -- Optional: Vector3.new(X, Y, Z)
     VehicleSpeed = 42,
+    BikeTurnSpeed = 18,
+    BikeAgentRadius = 2.3,
+    BikeMaxReplans = 5,
+    BikeFinalApproach = 12,
     ScooterMinTripDistance = 35,
     ScooterNearbyDistance = 14,
-    ScooterCooldownWait = 2,
+    ScooterCooldownWait = 10,
     ObstaclePollInterval = 0.05,
     VaultDuration = 0.65,
     ObstacleNoclip = true,
@@ -1297,6 +1303,12 @@ end
 local function tryOwnedTransport(token, destination)
     local c,h,root=character()
     if not root or (root.Position-destination).Magnitude<Config.ScooterMinTripDistance or type(fireproximityprompt)~="function" then return false end
+    local function indoors(p)
+        return (p.X>-170 and p.X<-98 and p.Z>96 and p.Z<174)
+            or (p.X>-288 and p.X<-236 and p.Z>330 and p.Z<412)
+            or (p.X>235 and p.X<276 and p.Z<-236 and p.Z>-292)
+    end
+    if indoors(root.Position) or indoors(destination) then return false end
     local owned
     Items.iterate_through_items_of_type(Data,"bike",function(item)
         if item.location=="hand" and (item.name=="EScooter" or item.name=="BMX") and not item.destroyed and (item.health or 1)>0 then
@@ -1307,9 +1319,15 @@ local function tryOwnedTransport(token, destination)
     API.Transport=owned.name
     status("Using inventory "..owned.name)
     local function findScooter()
+        local fallback
         for _,v in ipairs(workspace.Vehicles:GetChildren()) do
-            if v.Name==owned.name and v:GetAttribute("OwnerUserId")==player.UserId then return v end
+            if v:GetAttribute("OwnerUserId")==player.UserId then
+                local guid=v:GetAttribute("ItemGUID")
+                if guid==owned.guid then return v end
+                if not guid and v.Name==owned.name then fallback=v end
+            end
         end
+        return fallback
     end
     local function awaitVehicleState(predicate,timeout)
         local deadline=os.clock()+timeout
@@ -1332,7 +1350,7 @@ local function tryOwnedTransport(token, destination)
                 return false
             end
             status("EScooter cooldown - retrying "..action)
-            task.wait(0.35)
+            task.wait(1.5)
         until not alive(token)
         return false
     end
@@ -1340,17 +1358,25 @@ local function tryOwnedTransport(token, destination)
     h:MoveTo(root.Position)
     local existing=findScooter()
     local refreshed=false
-    if existing and (existing:GetPivot().Position-root.Position).Magnitude>Config.ScooterNearbyDistance then
-        local driver=existing:FindFirstChild("DriverSeat")
+    local existingSeat=existing and existing:FindFirstChild("DriverSeat",true)
+    if existing and ((existingSeat and existingSeat.Position or existing:GetPivot().Position)-root.Position).Magnitude>Config.ScooterNearbyDistance then
+        local driver=existingSeat
         if driver and driver.Occupant and driver.Occupant~=h then API.LastTransportError="Owned scooter is occupied" return false end
         status("Despawning distant EScooter")
-        if not toggleScooter("despawn") then return false end
-        if not awaitVehicleState(function()return not existing.Parent end,3) then
-            API.LastTransportError="Despawn not confirmed; spawn was not attempted"
-            return false
+        if not toggleScooter("despawn") then
+            if not existingSeat or (existingSeat.Position-root.Position).Magnitude>100 then return false end
+            status("Vehicle cooldown - retrieving parked "..owned.name)
+            local toward=root.Position-existingSeat.Position
+            local approach=existingSeat.Position+(toward.Magnitude>0.1 and toward.Unit*5 or Vector3.new(0,0,5))
+            if not walkingRoute(token,approach,"Running to parked "..owned.name) then return false end
+        else
+            if not awaitVehicleState(function()return not existing.Parent end,3) then
+                API.LastTransportError="Despawn not confirmed; spawn was not attempted"
+                return false
+            end
+            existing=nil
+            refreshed=true
         end
-        existing=nil
-        refreshed=true
     end
     if not existing then
         status("Spawning EScooter beside character")
@@ -1364,12 +1390,16 @@ local function tryOwnedTransport(token, destination)
     if not alive(token) then return false end
     local vehicle=findScooter()
     if not vehicle then API.LastTransportError="Vehicle spawn not replicated" return false end
-    local seat=vehicle:FindFirstChild("DriverSeat")
+    local seat=vehicle:FindFirstChild("DriverSeat",true)
     local prompt=vehicle:FindFirstChild("DrivePrompt",true)
     if not seat or not prompt then return false end
     API.LastScooterSpawnDistance=(seat.Position-root.Position).Magnitude
+    API.VehicleLocation={Guid=vehicle:GetAttribute("ItemGUID"),Position=tostring(seat.Position),Distance=API.LastScooterSpawnDistance}
+    logEvent("MOVE","Owned "..owned.name.." seat: "..tostring(seat.Position).."; distance="..math.floor(API.LastScooterSpawnDistance))
     if (root.Position-seat.Position).Magnitude>10 then
-        local reached=walkingRoute(token,seat.Position,"Running to owned EScooter")
+        local toward=root.Position-seat.Position
+        local approach=seat.Position+(toward.Magnitude>0.1 and toward.Unit*5 or Vector3.new(0,0,5))
+        local reached=walkingRoute(token,approach,"Running to owned "..owned.name)
         if not reached then return false end
     end
     if h.SeatPart~=seat then fireproximityprompt(prompt) end
@@ -1381,10 +1411,36 @@ local function tryOwnedTransport(token, destination)
     Sprint.sprinting.set(false)
     local controls=require(player.PlayerScripts.PlayerModule):GetControls()
     controls:Disable()
-    local points=roadRoute(root.Position,destination)
+    local clearDrive
+    local function planBikeRoute(goal)
+        local start=root.Position
+        local toward=Vector3.new(goal.X-start.X,0,goal.Z-start.Z)
+        toward=toward.Magnitude>0.1 and toward.Unit or Vector3.xAxis
+        local seeds={start}
+        -- The parked vehicle itself can occupy the starting navmesh cell.
+        for _,angle in ipairs({0,45,-45,90,-90,135,-135,180}) do
+            seeds[#seeds+1]=start+CFrame.Angles(0,math.rad(angle),0):VectorToWorldSpace(toward)*6
+        end
+        for i,seed in ipairs(seeds) do
+            if i==1 or clearDrive(vehicle:GetPivot().Position,seed) then
+                local path=Pathfinding:CreatePath({AgentRadius=Config.BikeAgentRadius,AgentHeight=5,AgentCanJump=false,AgentCanClimb=false,WaypointSpacing=6})
+                local ok=pcall(function()path:ComputeAsync(seed,goal) end)
+                if not alive(token) then return nil end
+                if ok and path.Status==Enum.PathStatus.Success then
+                    local points={}
+                    for _,waypoint in ipairs(path:GetWaypoints()) do
+                        if waypoint.Action==Enum.PathWaypointAction.Jump then return nil end
+                        points[#points+1]=waypoint.Position
+                    end
+                    return points
+                end
+            end
+        end
+    end
     local groundParams=RaycastParams.new()
     groundParams.FilterType=Enum.RaycastFilterType.Include
-    groundParams.FilterDescendantsInstances={workspace.Terrain,workspace.Map.RoadNetwork,workspace.Map.Sand}
+    groundParams.FilterDescendantsInstances={workspace.Terrain,workspace.Map}
+    groundParams.RespectCanCollide=true
     groundParams.IgnoreWater=false
     local obstacleParams=RaycastParams.new()
     obstacleParams.FilterType=Enum.RaycastFilterType.Exclude
@@ -1394,57 +1450,152 @@ local function tryOwnedTransport(token, destination)
     obstacleParams.RespectCanCollide=true
     local bounds,size=vehicle:GetBoundingBox()
     local offset=vehicle:GetPivot().Position.Y-(bounds.Position.Y-size.Y/2)+0.08
+    local chassis=vehicle:FindFirstChild("Chassis") or vehicle.PrimaryPart
+    local function brake()
+        if chassis and chassis.Parent then
+            chassis.AssemblyLinearVelocity=Vector3.zero
+            chassis.AssemblyAngularVelocity=Vector3.zero
+        end
+    end
     local cleaned=false
     local function cleanup()
         if cleaned then return end
         cleaned=true
+        brake()
         if seat.Parent then seat.ThrottleFloat=0 seat.SteerFloat=0 end
         controls:Enable()
         if h.Parent and h.SeatPart==seat then pcall(netGet,"exit_seat") h.Sit=false end
         driveCleanup=nil
     end
     driveCleanup=cleanup
-    status("EScooter - following ground route")
-    local drivingOK=true
-    for _,point in ipairs(points) do
-        local deadline=os.clock()+60
-        while alive(token) and seat.Parent and h.SeatPart==seat do
-            local pivot=vehicle:GetPivot()
-            local delta=Vector3.new(point.X-pivot.Position.X,0,point.Z-pivot.Position.Z)
-            if delta.Magnitude<5 then break end
-            if os.clock()>deadline then drivingOK=false break end
-            local dt=math.min(RunService.Heartbeat:Wait(),0.05)
-            if not alive(token) then drivingOK=false break end
-            local direction=delta.Unit
-            local obstacle=workspace:Raycast(pivot.Position,direction*6,obstacleParams)
-            if obstacle and obstacle.Normal.Y<0.65 then
-                local landingXZ=pivot.Position+direction*12
-                local clear=workspace:Raycast(pivot.Position+Vector3.new(0,13,0),direction*12,obstacleParams)
-                local land=workspace:Raycast(landingXZ+Vector3.new(0,15,0),Vector3.new(0,-35,0),groundParams)
-                if clear or not land or land.Material==Enum.Material.Water then API.LastTransportError="Obstacle needs ground detour" drivingOK=false break end
-                local landing=Vector3.new(landingXZ.X,land.Position.Y+offset,landingXZ.Z)
-                local started=os.clock()
-                API.ObstacleFlights=(API.ObstacleFlights or 0)+1
-                while alive(token) and os.clock()-started<Config.VaultDuration and h.SeatPart==seat do
-                    local alpha=math.min((os.clock()-started)/Config.VaultDuration,1)
-                    local position=pivot.Position:Lerp(landing,alpha)+Vector3.new(0,math.sin(alpha*math.pi)*12,0)
-                    vehicle:PivotTo(CFrame.lookAt(position,position+direction))
-                    vehicle.Chassis.AssemblyLinearVelocity=Vector3.zero
-                    RunService.Heartbeat:Wait()
-                end
-                API.LastVaultDuration=os.clock()-started
-                if alive(token) then vehicle:PivotTo(CFrame.lookAt(landing,landing+direction)) end
-                continue
+    local function floorAt(position)
+        local hit=workspace:Raycast(position+Vector3.new(0,8,0),Vector3.new(0,-24,0),groundParams)
+        if hit and hit.Material~=Enum.Material.Water and hit.Normal.Y>0.7 then return hit.Position end
+    end
+    local halfWidth=math.clamp(size.X/2,0.85,1.35)
+    clearDrive=function(a,b)
+        local delta=Vector3.new(b.X-a.X,0,b.Z-a.Z)
+        if delta.Magnitude<0.05 then return true end
+        local floor=floorAt(a)
+        if not floor then API.BikeRoadIssue="No ground at route start" return false end
+        local side=Vector3.new(-delta.Z,0,delta.X).Unit*halfWidth
+        for _,shift in ipairs({Vector3.zero,side,-side}) do
+            for _,height in ipairs({1.8,3.2}) do
+                local hit=workspace:Raycast(Vector3.new(a.X,floor.Y+height,a.Z)+shift,delta,obstacleParams)
+                if hit then API.BikeBlockedPart=hit.Instance:GetFullName() return false end
             end
-            local step=pivot.Position+direction*math.min(Config.VehicleSpeed*dt,delta.Magnitude)
-            local floor=workspace:Raycast(Vector3.new(step.X,pivot.Position.Y+8,step.Z),Vector3.new(0,-38,0),groundParams)
-            if not floor or floor.Material==Enum.Material.Water or math.abs((floor.Position.Y+offset)-pivot.Position.Y)>9 then API.LastTransportError="Road segment has no safe dry ground" drivingOK=false break end
-            local position=Vector3.new(step.X,floor.Position.Y+offset,step.Z)
-            vehicle:PivotTo(CFrame.lookAt(position,position+direction))
-            local chassis=vehicle:FindFirstChild("Chassis")
-            if chassis then chassis.AssemblyLinearVelocity=direction*8 chassis.AssemblyAngularVelocity=Vector3.zero end
         end
-        if not drivingOK or not alive(token) or h.SeatPart~=seat then break end
+        local last=floor
+        for distance=math.min(1.5,delta.Magnitude),delta.Magnitude+1.49,1.5 do
+            local q=a+delta.Unit*math.min(distance,delta.Magnitude)
+            local land=floorAt(Vector3.new(q.X,last.Y+offset,q.Z))
+            if not land then API.BikeRoadIssue="No dry ground ahead" return false end
+            if math.abs(land.Y-last.Y)>2.2 then API.BikeRoadIssue="Ground height change: "..tostring(land.Y-last.Y) return false end
+            last=land
+        end
+        return true
+    end
+    local target=destination
+    brake()
+    local points=planBikeRoute(target)
+    if not points then
+        local origin=vehicle:GetPivot().Position
+        local toward=Vector3.new(origin.X-destination.X,0,origin.Z-destination.Z)
+        toward=toward.Magnitude>0.1 and toward.Unit or Vector3.xAxis
+        for _,distance in ipairs({18,32}) do
+            for _,angle in ipairs({0,45,-45,90,-90}) do
+                local candidate=destination+CFrame.Angles(0,math.rad(angle),0):VectorToWorldSpace(toward)*distance
+                local floor=floorAt(candidate)
+                if floor then
+                    candidate=Vector3.new(candidate.X,floor.Y+3,candidate.Z)
+                    points=planBikeRoute(candidate)
+                    if points then target=candidate break end
+                end
+            end
+            if points then break end
+        end
+    end
+    if not points then API.LastTransportError="No safe bike route" cleanup() return false end
+    status(owned.name.." - following planned ground route")
+    logEvent("MOVE","Bike route: "..#points.." waypoints")
+    API.BikeRouteWaypoints=#points
+    local index,replans,localDetours=1,0,0
+    local arrived=false
+    local tripDeadline=os.clock()+math.max(45,(root.Position-target).Magnitude/10+30)
+    local lastProgress,lastPosition=os.clock(),vehicle:GetPivot().Position
+    local visits={}
+    while alive(token) and seat.Parent and h.SeatPart==seat and index<=#points do
+        local position=vehicle:GetPivot().Position
+        if Vector3.new(destination.X-position.X,0,destination.Z-position.Z).Magnitude<Config.BikeFinalApproach then arrived=true break end
+        if os.clock()>tripDeadline then API.LastTransportError="Bike route timed out" break end
+        local point=points[index]
+        API.BikeWaypoint=tostring(point)
+        local delta=Vector3.new(point.X-position.X,0,point.Z-position.Z)
+        if delta.Magnitude<1.6 then index+=1 continue end
+        if (position-lastPosition).Magnitude>1 then lastProgress,lastPosition=os.clock(),position end
+        local direction=delta.Unit
+        local speed=Config.VehicleSpeed
+        if index<#points then
+            local turn=Vector3.new(points[index+1].X-point.X,0,points[index+1].Z-point.Z)
+            if turn.Magnitude>0.1 and direction:Dot(turn.Unit)<0.8 and delta.Magnitude<8 then speed=Config.BikeTurnSpeed end
+        end
+        local ahead=position+direction*math.min(delta.Magnitude,math.max(3,speed*0.18))
+        if not clearDrive(position,ahead) or os.clock()-lastProgress>1.2 then
+            brake()
+            local skip
+            for future=math.min(index+6,#points),index+1,-1 do
+                if clearDrive(position,points[future]) then skip=future break end
+            end
+            if skip then index=skip continue end
+            local bypass,score
+            local goalIndex=math.min(index+3,#points)
+            local goal=points[goalIndex]
+            if os.clock()-lastProgress<=1.2 and localDetours<6 then
+                for _,length in ipairs({6,10}) do
+                    for _,angle in ipairs({40,-40,75,-75,110,-110}) do
+                        local candidate=position+CFrame.Angles(0,math.rad(angle),0):VectorToWorldSpace(direction)*length
+                        local key=math.floor(candidate.X/5)..":"..math.floor(candidate.Z/5)
+                        local cost=(candidate-goal).Magnitude+math.abs(angle)*0.025+(visits[key] or 0)*12
+                        if (not score or cost<score) and clearDrive(position,candidate) and clearDrive(candidate,goal) then bypass,score=candidate,cost end
+                    end
+                end
+            end
+            if bypass then
+                local key=math.floor(bypass.X/5)..":"..math.floor(bypass.Z/5)
+                visits[key]=(visits[key] or 0)+1
+                for _=index,goalIndex-1 do table.remove(points,index) end
+                table.insert(points,index,bypass)
+                localDetours+=1
+                API.BikeDetours=(API.BikeDetours or 0)+1
+                logEvent("MOVE","Bike steering around obstacle","bike-detour",1)
+            else
+                replans+=1
+                API.BikeReplans=(API.BikeReplans or 0)+1
+                if replans>Config.BikeMaxReplans then API.LastTransportError="Bike detour attempts exhausted" break end
+                local revised=planBikeRoute(target)
+                if not revised then API.LastTransportError="Bike route became blocked" break end
+                points,index=revised,1
+                localDetours=0
+                lastProgress,lastPosition=os.clock(),position
+                logEvent("MOVE","Replanning bike route; attempt "..replans)
+            end
+            task.wait(0.05)
+            continue
+        end
+        local dt=math.min(RunService.Heartbeat:Wait(),0.05)
+        if not alive(token) or h.SeatPart~=seat then break end
+        local step=position+direction*math.min(speed*dt,delta.Magnitude)
+        local floor=floorAt(step)
+        if not floor then API.LastTransportError="Bike reached edge of dry ground" break end
+        local grounded=Vector3.new(step.X,floor.Y+offset,step.Z)
+        vehicle:PivotTo(CFrame.lookAt(grounded,grounded+direction))
+        brake()
+        API.VehicleLocation={Guid=owned.guid,Position=tostring(seat.Position),Distance=(seat.Position-root.Position).Magnitude}
+    end
+    if alive(token) and h.SeatPart==seat and (arrived or index>#points) then
+        API.BikeRoutesCompleted=(API.BikeRoutesCompleted or 0)+1
+        API.LastTransportError=nil
+        logEvent("MOVE","Bike route complete; walking final approach")
     end
     cleanup()
     task.wait(0.5)
@@ -1452,10 +1603,38 @@ local function tryOwnedTransport(token, destination)
     return false
 end
 local leaveFishBuyer,leaveHardware
+local function inBikeShop(point)
+    return point.X>235 and point.X<276 and point.Z<-236 and point.Z>-292
+end
+local function crossBikeDoor(token,entering)
+    local _,h,root=character()
+    if not h or not root then return false end
+    local target=Vector3.new(250.91,255.2,entering and -245 or -225)
+    status(entering and "Entering bike shop through public door" or "Exiting bike shop before spawning transport")
+    local deadline=os.clock()+8
+    repeat
+        h:MoveTo(target)
+        local delta=root.Position-target
+        if Vector3.new(delta.X,0,delta.Z).Magnitude<3 then return true end
+        task.wait(Config.ObstaclePollInterval)
+    until not alive(token) or h.Health<=0 or os.clock()>deadline
+    return false
+end
+local function leaveBikeShop(token)
+    local _,_,root=character()
+    if not root then return false end
+    if not walkingRoute(token,Vector3.new(243,255.2,root.Position.Z),"Following bike shop display aisle") then return false end
+    if not walkingRoute(token,Vector3.new(243,255.2,-245),"Approaching bike shop exit aisle") then return false end
+    if not walkingRoute(token,Vector3.new(250.91,255.2,-245),"Approaching bike shop door") then return false end
+    return crossBikeDoor(token,false)
+end
 walkToSpot = function(token,destination,caption)
     destination=destination or API.Spot
     local _,_,travelRoot=character()
     API.Travelling=true
+    if travelRoot and inBikeShop(travelRoot.Position) and not inBikeShop(destination) then
+        if not leaveBikeShop(token) then return false,"Could not exit bike shop through its door" end
+    end
     if leaveHardware and travelRoot then
         local function insideHardware(point)
             return point.X>-170 and point.X<-98 and point.Z>96 and point.Z<174
@@ -1824,19 +2003,39 @@ local function bikeOffer(token)
 end
 local function ensureBike(token)
     if not Config.AutoBuyBike or ownedTravelBike() then return true end
-    if os.clock()-(API.LastBikePurchaseAttempt or -math.huge)<60 then return true end
+    if os.clock()-(API.LastBikePurchaseAttempt or -math.huge)<60 then
+        API.BikePurchaseStatus="Waiting for bike purchase retry cooldown"
+        return true
+    end
     local crate,chosen,price=bikeOffer(token)
     if not chosen then API.BikePurchaseStatus="Bike case not streamed" return true end
     if cash()+bank()<price+Config.BikePurchaseReserve then API.BikePurchaseStatus="Saving for basic bike case" return true end
     if inventoryFull() then API.BikePurchaseStatus="No inventory space for bike" return true end
     if cash()<price and not Config.AllowPurchaseWithdrawals then return true end
-    API.LastBikePurchaseAttempt=os.clock()
     if cash()<price and not transfer(token,"bank","hand",price-cash()) then return false end
     local outside=Vector3.new(250.91,255.2,-225)
     local inside=Vector3.new(250.91,255.2,-245)
-    if not moveTo(token,outside,"Travelling to bike shop") then return false end
-    if not moveTo(token,inside,"Entering bike shop") then return false end
-    if not moveTo(token,crate:GetPivot().Position,"Buying basic bike case") then return false end
+    local _,_,root=character()
+    if not root then return false end
+    local p=root.Position
+    local inShop=inBikeShop(p)
+    if not inShop then
+        -- The west wall/display cannot be crossed diagonally from the street.
+        if p.X<235 and p.Z<-230 and p.Z>-320 then
+            if not moveTo(token,Vector3.new(222,255.2,p.Z),"Following bike shop exterior") then return false end
+            if not moveTo(token,Vector3.new(222,255.2,-225),"Going around bike shop wall") then return false end
+        end
+        if not moveTo(token,outside,"Travelling to bike shop entrance") then return false end
+        if not crossBikeDoor(token,true) then return false end
+    end
+    local beacon=crate:FindFirstChild("Beacon")
+    local touch=beacon and beacon:FindFirstChild("TouchPart")
+    if not touch or not touch:IsA("BasePart") then error("Bike crate interaction beacon not available") end
+    API.BikeShopTarget=tostring(touch.Position)
+    API.BikePurchaseStatus="Approaching bike case interaction point"
+    logEvent("BUY","Bike case interaction point: "..tostring(touch.Position))
+    if not moveTo(token,touch.Position,"Approaching bike case interaction point") then return false end
+    API.LastBikePurchaseAttempt=os.clock()
     local accepted,reason=netGet("open_crate",chosen,"money")
     logEvent("BUY","Bike case request: "..tostring(accepted~=false and accepted~=nil).."; price="..price.."; reason="..tostring(reason))
     API.LastBikePurchaseReply={Accepted=accepted~=false and accepted~=nil,Reason=reason,Price=price}
@@ -1844,6 +2043,7 @@ local function ensureBike(token)
         if waitFor(token,function()return ownedTravelBike()~=nil end,8) then
             API.BikesPurchased=(API.BikesPurchased or 0)+1
             API.BikePurchaseStatus="Owned: "..ownedTravelBike().name
+            logEvent("BUY","Bike confirmed in inventory: "..ownedTravelBike().name)
         else API.LastWarning="Bike purchase was accepted but inventory confirmation is pending" end
     else API.BikePurchaseStatus="Purchase rejected: "..tostring(reason) end
     if not alive(token) then return false end
@@ -2146,9 +2346,11 @@ local function starterChoices()
             local kind=model and model:GetAttribute("FishingItem")
             local cost=model and Items.get_item_rarity_price(name)
             if type(cost)=="number" and cost>0 then
-                if kind=="rod" and (not rod or cost<rod.Cost) then rod={Name=name,Cost=cost} end
-                if kind=="bait" and name~="Squidtec" and (not bait or cost<bait.Cost) then
-                    bait={Name=name,Cost=cost,Ammo=Items.get_item_ammo_type(name)}
+                if kind=="rod" and (not rod or (Config.AutoUpgradeRods and unlock.level>rod.Level) or (not Config.AutoUpgradeRods and cost<rod.Cost)) then
+                    rod={Name=name,Cost=cost,Level=unlock.level}
+                end
+                if kind=="bait" and name~="Squidtec" and (not bait or unlock.level>bait.Level) then
+                    bait={Name=name,Cost=cost,Level=unlock.level,Ammo=Items.get_item_ammo_type(name)}
                 end
             end
         end
@@ -2180,22 +2382,31 @@ local function stockerStep(token,position,caption)
     status(caption)
     API.Travelling=true
     API.Transport="Running"
+    API.StockerWaypoint=tostring(position)
+    logEvent("STOCKER",caption.." -> "..tostring(position),"stocker-waypoint",0.2)
+    local insideShop=root.Position.X>=85 and root.Position.X<=173 and root.Position.Z>=158 and root.Position.Z<=220
+    if not insideShop and (root.Position-position).Magnitude>60 then
+        return moveTo(token,position,caption)
+    end
     local lastPosition,lastProgress=root.Position,os.clock()
     local deadline=os.clock()+math.max(10,(root.Position-position).Magnitude/7+4)
+    hum:MoveTo(position)
     while alive(token) do
         local delta=Vector3.new(root.Position.X-position.X,0,root.Position.Z-position.Z).Magnitude
-        if delta<1.7 then break end
+        if delta<Config.StockerArrivalDistance then break end
         if hum.Health<=0 then error("Character died during Stocker travel") end
-        hum:MoveTo(position)
+        if hum.SeatPart then hum.Sit=false hum:ChangeState(Enum.HumanoidStateType.GettingUp) end
         if (root.Position-lastPosition).Magnitude>0.5 then lastPosition,lastProgress=root.Position,os.clock() end
-        if os.clock()-lastProgress>1.2 or os.clock()>deadline then
-            API.Travelling=false
-            return moveTo(token,position,caption)
+        if os.clock()-lastProgress>Config.StockerBlockedTime or os.clock()>deadline then
+            logEvent("STOCKER","Corridor obstructed; recalculating on foot","stocker-blocked",1)
+            -- Local shop recovery must not spawn a vehicle indoors.
+            local reached,reason=walkingRoute(token,position,caption)
+            if not reached and alive(token) then error(reason or "Stocker corridor blocked") end
+            return reached and alive(token)
         end
         task.wait(0.05)
     end
-    API.Travelling=false
-    Sprint.sprinting.set(false)
+    -- Keep movement continuous between the adjacent aisle waypoints.
     return alive(token)
 end
 local function assignedStockShelf()
@@ -2233,6 +2444,13 @@ local function earnStarterFunds(token,target)
     local normalBox=workspace.Map.Tiles.GasStationTile.Quick11.Interior.ShelfStockingJob:FindFirstChild("NormalBox")
     local prompt=normalBox and normalBox:FindFirstChildWhichIsA("ProximityPrompt",true)
     if not normalBox or not prompt or type(fireproximityprompt)~="function" then error("Normal stock box/prompt unavailable") end
+    local progress=loadModule("Game.UI.ProgressBar")
+    local _,_,entryRoot=character()
+    local insideShop=entryRoot and entryRoot.Position.X>=85 and entryRoot.Position.X<=173 and entryRoot.Position.Z>=158 and entryRoot.Position.Z<=220
+    if not insideShop then
+        if not stockerStep(token,Vector3.new(129,255.4,151),"Going to Quick11 entrance") then return false end
+        if not stockerStep(token,Vector3.new(129,255.4,170),"Entering Quick11 through public door") then return false end
+    end
     if player:GetAttribute("Job")~="shelf_stocker" then
         local _,_,root=character()
         if root.Position.Z<158 or root.Position.X<90 or root.Position.X>173 then
@@ -2262,21 +2480,40 @@ local function earnStarterFunds(token,target)
                 if not stockerStep(token,Vector3.new(130,255.4,203),"Leaving shelf aisle") then return false end
             end
             if not stockerStep(token,Vector3.new(145,255.4,203),"Going to stock boxes") then return false end
-            if not stockerStep(token,normalBox.Position,"Picking up a normal stock box") then return false end
+            -- The prompt reaches farther than the physical crate; stop in front
+            -- of it instead of trying to walk through its collidable mesh.
+            local pickupAt=normalBox.Position+Vector3.new(0,0,-5)
+            if (root.Position-normalBox.Position).Magnitude>math.max(3,prompt.MaxActivationDistance-1) then
+                if not stockerStep(token,pickupAt,"Approaching stock box pickup") then return false end
+            end
+            API.Travelling=false
+            Sprint.sprinting.set(false)
+            hum:MoveTo(root.Position)
             fireproximityprompt(prompt)
             if not waitFor(token,function()return jobBox()~=nil end,5) then error("Stock box pickup not confirmed") end
         end
         if not waitFor(token,function()return assignedStockShelf()~=nil end,5) then error("No shelf assigned by server") end
         local shelf=assignedStockShelf()
-        if not stockerStep(token,Vector3.new(145,255.4,203),"Carrying stock to the shop") then return false end
-        if not stockerStep(token,Vector3.new(130,255.4,203),"Entering shelf aisle") then return false end
-        local aisleZ=shelf.Position.Z+shelf.Size.Z/2+2
-        if not stockerStep(token,Vector3.new(130,255.4,aisleZ),"Finding assigned shelf row") then return false end
+        -- Shelf trigger centres are already in the walking aisles. Adding half
+        -- the trigger depth put the old approach inside the physical shelving.
+        local aisleZ=shelf.Position.Z
+        if root.Position.X>137 then
+            if not stockerStep(token,Vector3.new(145,255.4,203),"Carrying stock to the shop") then return false end
+            if not stockerStep(token,Vector3.new(130,255.4,203),"Entering shelf aisle") then return false end
+        end
+        local alreadyInRow=root.Position.X>98 and root.Position.X<127 and math.abs(root.Position.Z-aisleZ)<2.5
+        if not alreadyInRow then
+            if root.Position.X<127 then
+                if not stockerStep(token,Vector3.new(130,255.4,root.Position.Z),"Leaving current row through clear aisle") then return false end
+            end
+            if not stockerStep(token,Vector3.new(130,255.4,aisleZ),"Finding assigned shelf row") then return false end
+        end
         if not stockerStep(token,Vector3.new(shelf.Position.X,255.4,aisleZ),"Approaching assigned shelf") then return false end
         -- Touching the assigned shelf runs the native timed stocking interaction.
         status("Stocking shelf for fishing equipment")
+        API.Travelling=false
+        Sprint.sprinting.set(false)
         hum:MoveTo(Vector3.new(shelf.Position.X,root.Position.Y,shelf.Position.Z))
-        local progress=loadModule("Game.UI.ProgressBar")
         local began=waitFor(token,function()return progress.bar_enabled.get() or cash()+bank()>before end,2)
         if not alive(token) then return false end
         if not began and jobBox() and (root.Position-shelf.Position).Magnitude<9 then
@@ -2286,10 +2523,14 @@ local function earnStarterFunds(token,target)
         hum:MoveTo(root.Position)
         local paid=waitFor(token,function()
             if player.Character~=workCharacter or hum.Health<=0 or hum:GetAttribute("IsDead")==true then error("Character died during stocking") end
-            return cash()+bank()>before
+            return not progress.bar_enabled.get() and cash()+bank()>before
         end,Config.StockerWorkTimeout)
         if not alive(token) then return false end
         if not paid then error("Stocking cycle did not produce a confirmed payment") end
+        -- Some stock boxes can remain equipped; wait briefly for the server's
+        -- next assignment without insisting that the tool must disappear.
+        waitFor(token,function()return jobBox()==nil or assignedStockShelf()~=shelf end,0.35)
+        if not alive(token) then return false end
         API.StockerCycles=(API.StockerCycles or 0)+1
         API.RetryCount=0
         API.StockerEarned=(API.StockerEarned or 0)+(cash()+bank()-before)
@@ -2325,6 +2566,8 @@ local function earnStarterFunds(token,target)
         if not stockerStep(token,Vector3.new(129,255.4,151),"Leaving Quick11 to buy fishing gear") then return false end
     end
     API.StockerShelf=nil
+    API.Travelling=false
+    Sprint.sprinting.set(false)
     API.Phase="Preparing fishing equipment"
     return true
 end
@@ -2352,19 +2595,6 @@ local function ensureStartupKit(token)
     local rod,bait=starterChoices()
     if not rod or not bait then error("Starter rod or bait definition is unavailable") end
     local targetBait=math.clamp(Config.StarterBaitAmount,1,50)
-    local cheapestFill=math.max(0,targetBait-baitAmount(bait.Ammo))*bait.Cost
-    for _,unlock in ipairs(Unlocks) do
-        local name=unlock.reward_info and unlock.reward_info.tool_name
-        if name and name~="Squidtec" and Skills.has_skill(Data,"fishing",unlock.name) then
-            local model=Items.get_item_instance(name)
-            if model and model:GetAttribute("FishingItem")=="bait" then
-                local ammo=Items.get_item_ammo_type(name)
-                local cost=Items.get_item_rarity_price(name)
-                local fill=math.max(0,targetBait-baitAmount(ammo))*cost
-                if fill<cheapestFill then bait={Name=name,Cost=cost,Ammo=ammo} cheapestFill=fill end
-            end
-        end
-    end
     local needRod=not hasUsableRod()
     local needBike=Config.AutoBuyBike and not ownedTravelBike()
     local bikeCost=0
@@ -2375,6 +2605,8 @@ local function ensureStartupKit(token)
         bikeCost=price
     end
     local baitToBuy=math.max(0,targetBait-baitAmount(bait.Ammo))
+    API.DesiredRod,API.DesiredBait=rod.Name,bait.Name
+    logEvent("BUY","Startup gear target: "..rod.Name.."; "..targetBait.." x "..bait.Name)
     local reserve=needBike and Config.BikePurchaseReserve or 0
     local target=(needRod and rod.Cost or 0)+baitToBuy*bait.Cost+bikeCost+reserve
     API.StartupKitPlan={Rod=rod.Name,NeedRod=needRod,Bait=bait.Name,BaitTarget=targetBait,BaitToBuy=baitToBuy,
@@ -2422,13 +2654,14 @@ local function prepareEquipment(token)
         end
     end
     local desiredRod, desiredBait
+    local rodLevel,baitLevel=-1,-1
     for _, unlock in ipairs(Unlocks) do
-        if unlock.level <= API.Level and unlock.reward_info and unlock.reward_info.tool_name then
+        if Skills.has_skill(Data,"fishing",unlock.name) and unlock.reward_info and unlock.reward_info.tool_name then
             local name = unlock.reward_info.tool_name
             local model = Items.get_item_instance(name)
-            if model and model:GetAttribute("FishingItem") == "rod" then desiredRod = name end
+            if model and model:GetAttribute("FishingItem") == "rod" and unlock.level>rodLevel then desiredRod,rodLevel=name,unlock.level end
             -- Squidtec only works around Deep Sea Island, so keep mainland bait for mainland zones.
-            if model and model:GetAttribute("FishingItem") == "bait" and name ~= "Squidtec" then desiredBait = name end
+            if model and model:GetAttribute("FishingItem") == "bait" and name ~= "Squidtec" and unlock.level>baitLevel then desiredBait,baitLevel=name,unlock.level end
         end
     end
     if Config.AutoUpgradeRods and desiredRod and not ownedRod(desiredRod) then
@@ -2440,13 +2673,14 @@ local function prepareEquipment(token)
     end
     if not desiredBait then error("No unlocked mainland bait found") end
     local existingName, existingAmmo
+    local existingLevel=-1
     for _,unlock in ipairs(Unlocks) do
         local name=unlock.reward_info and unlock.reward_info.tool_name
         if name and name~="Squidtec" and unlock.level<=API.Level then
             local model=Items.get_item_instance(name)
-            if model and model:GetAttribute("FishingItem")=="bait" then
+            if model and model:GetAttribute("FishingItem")=="bait" and unlock.level>existingLevel then
                 local ammoType=Items.get_item_ammo_type(name)
-                if baitAmount(ammoType)>0 then existingName,existingAmmo=name,ammoType end
+                if baitAmount(ammoType)>0 then existingName,existingAmmo,existingLevel=name,ammoType,unlock.level end
             end
         end
     end
@@ -2455,11 +2689,16 @@ local function prepareEquipment(token)
         local squid=Items.get_item_ammo_type("Squidtec")
         existingName,existingAmmo=baitAmount(squid)>0 and "Squidtec" or nil,baitAmount(squid)>0 and squid or nil
     end
-    if existingAmmo then
+    API.DesiredRod,API.DesiredBait=desiredRod,desiredBait
+    local desiredAmmo=Items.get_item_ammo_type(desiredBait)
+    if existingAmmo==desiredAmmo then
         API.BaitName,API.BaitAmmo=existingName,existingAmmo
         return deposit(token)
     end
     local ammo = Items.get_item_ammo_type(desiredBait)
+    if existingAmmo and existingAmmo~=ammo then
+        logEvent("BUY","Bait upgrade: "..tostring(existingName).." -> "..desiredBait)
+    end
     if baitAmount(ammo) <= Config.BaitLowWater and not inventoryFull() then
         local price = Items.get_item_rarity_price(desiredBait)
         local tripAmount=Config.BaitPerTrip
@@ -2505,6 +2744,7 @@ end
 
 API.Snapshot = function()
     return {Level = API.Level, XP = API.FishingXP, Zone = API.ZoneName, Bait = API.BaitName,
+        DesiredRod=API.DesiredRod,DesiredBait=API.DesiredBait,
         Fish = fishCount(), Inventory = Items.get_inventory_count(Data).hand, Capacity = capacity,
         Cash = cash(), Bank = bank(), Sold = API.Sold, Deposited = API.Deposited, Withdrawn = API.Withdrawn,
         LastSaleReason=API.LastSaleReason,LastSellSkip=API.LastSellSkip,
@@ -2527,6 +2767,8 @@ API.Snapshot = function()
         DropsCollected=API.DropsCollected or 0,DeathRecoveries=API.DeathRecoveries or 0,
         DeathLootPending=API.DeathRecovery~=nil,BikesPurchased=API.BikesPurchased or 0,BikePurchaseStatus=API.BikePurchaseStatus,
         TransportTrips=API.TransportTrips or 0,TransportError=API.LastTransportError,
+        BikeRoutesCompleted=API.BikeRoutesCompleted or 0,BikeDetours=API.BikeDetours or 0,BikeReplans=API.BikeReplans or 0,
+        BikeWaypoint=API.BikeWaypoint,BikeBlockedPart=API.BikeBlockedPart,BikeRoadIssue=API.BikeRoadIssue,
         ScooterRefreshes=API.ScooterRefreshes or 0,ScooterSpawnDistance=API.LastScooterSpawnDistance,
         VehicleReply=API.LastVehicleReply,ObstaclePollInterval=Config.ObstaclePollInterval,
         LastObstacleResponseTime=API.LastObstacleResponseTime,
@@ -2534,6 +2776,7 @@ API.Snapshot = function()
         AutoPlayCompleted=API.AutoPlayCompleted or false,AutoPlayAttempts=API.AutoPlayAttempts or 0,
         AutoAvatarSkipAttempts=API.AutoAvatarSkipAttempts or 0,
         StockerCycles=API.StockerCycles or 0,StockerEarned=API.StockerEarned or 0,
+        StockerWaypoint=API.StockerWaypoint,
         StarterTarget=API.StarterTarget,StarterRodPurchased=API.StarterRodPurchased,Phase=API.Phase,
         AutoRespawnAttempts=API.AutoRespawnAttempts or 0,AutoRespawns=API.AutoRespawns or 0}
 end
