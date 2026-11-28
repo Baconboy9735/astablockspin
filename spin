@@ -22,7 +22,6 @@ getgenv().BlockSpinFishingConfig = {
     ReuseExistingStartupKit = true,
     AutoRetryErrors = true,
     RetryDelay = 5,
-    MaxRetryDelay = 30,
     StockerWorkTimeout = 45,
     StockerArrivalDistance = 2.2,
     StockerBlockedTime = 0.65,
@@ -1055,7 +1054,7 @@ function API.Retry(message)
     API.LastRetryReason=reason
     if not Config.AutoRetryErrors then API.Stop("Error: "..reason) return end
     API.RetryCount=(API.RetryCount or 0)+1
-    local delay=math.min(Config.MaxRetryDelay,Config.RetryDelay*API.RetryCount)
+    local delay=Config.RetryDelay
     local manualSerial=API.ManualStopSerial or 0
     API.Stop("Retry in "..delay.."s: "..reason,true)
     if destroyed or (API.ManualStopSerial or 0)~=manualSerial then return end
@@ -2049,21 +2048,53 @@ local leaveFishBuyer,leaveHardware,leaveCarDealer
 local function inBikeShop(point)
     return point.X>235 and point.X<276 and point.Z<-236 and point.Z>-292
 end
-local function crossBikeDoor(token,entering)
-    local _,h,root=character()
+local function crossDoor(token,approach,target,caption)
+    local c,h,root=character()
     if not h or not root then return false end
-    local target=Vector3.new(250.91,255.2,entering and -245 or -225)
-    status(entering and "Entering bike shop through public door" or "Exiting bike shop before spawning transport")
-    local deadline=os.clock()+8
-    repeat
-        updateTravelSprint()
-        h:MoveTo(target)
-        local delta=root.Position-target
-        if Vector3.new(delta.X,0,delta.Z).Magnitude<3 and math.abs(delta.Y)<4 then Sprint.sprinting.set(false) return true end
-        task.wait(Config.ObstaclePollInterval)
-    until not alive(token) or h.Health<=0 or os.clock()>deadline
-    Sprint.sprinting.set(false)
+    local direction=Vector3.new(target.X-approach.X,0,target.Z-approach.Z).Unit
+    local side=Vector3.new(-direction.Z,0,direction.X)
+    local function active()
+        return alive(token) and player.Character==c and root.Parent and h.Health>0
+    end
+    local function walk(point,timeout)
+        local deadline=os.clock()+timeout
+        local best,progressAt=math.huge,os.clock()
+        h:MoveTo(point)
+        while active() and os.clock()<deadline do
+            local delta=root.Position-point
+            local horizontalDistance=Vector3.new(delta.X,0,delta.Z).Magnitude
+            if horizontalDistance<1.5 and math.abs(delta.Y)<4 then return true end
+            if delta.Magnitude<best-0.35 then
+                best,progressAt=delta.Magnitude,os.clock()
+            elseif os.clock()-progressAt>1.8 then
+                return false
+            end
+            task.wait(0.1)
+        end
+        return false
+    end
+    for attempt,lane in ipairs({0,1.6,-1.6}) do
+        if not active() then return false end
+        status(attempt==1 and caption or caption.." - realigning ("..attempt.."/3)")
+        local offset=side*lane
+        if attempt>1 then
+            local here=root.Position
+            -- Step away from the frame before approaching the other side of the opening.
+            walk(here-direction*2,1.2)
+        end
+        if not active() then return false end
+        if walk(approach+offset,7) and active() and walk(target+offset,7) then return true end
+    end
+    if active() then
+        h:MoveTo(root.Position)
+        error(caption.." blocked after three approaches")
+    end
     return false
+end
+local function crossBikeDoor(token,entering)
+    local outside,inside=Vector3.new(250.91,255.2,-225),Vector3.new(250.91,255.2,-245)
+    return crossDoor(token,entering and outside or inside,entering and inside or outside,
+        entering and "Entering bike shop" or "Exiting bike shop")
 end
 local function leaveBikeShop(token)
     local _,_,root=character()
@@ -2527,22 +2558,11 @@ local function ensureBike(token)
 end
 -- The mainland buyer is indoors; enter through the south double door.
 local function crossCarDealerDoor(token,entering)
-    local _,hum,root=character()
-    if not hum or not root then return false end
-    local target=Vector3.new(122.35,255.2,entering and 484 or 440)
-    status(entering and "Entering car dealership through front door" or "Leaving car dealership through front door")
-    local deadline=os.clock()+8
-    repeat
-        if not alive(token) or hum.Health<=0 then break end
-        updateTravelSprint()
-        hum:MoveTo(target)
-        local delta=root.Position-target
-        if Vector3.new(delta.X,0,delta.Z).Magnitude<2.5 and math.abs(delta.Y)<4 then Sprint.sprinting.set(false) return true end
-        task.wait(Config.ObstaclePollInterval)
-    until os.clock()>deadline
-    Sprint.sprinting.set(false)
-    if alive(token) then error("Car dealership front door is blocked") end
-    return false
+    local outside,inside=Vector3.new(122.35,255.2,460),Vector3.new(122.35,255.2,484)
+    if not crossDoor(token,entering and outside or inside,entering and inside or outside,
+        entering and "Entering car dealership" or "Exiting car dealership") then return false end
+    if entering then return true end
+    return walkingRoute(token,Vector3.new(122.35,255.2,440),"Leaving dealership canopy")
 end
 leaveCarDealer=function(token)
     if not walkingRoute(token,Vector3.new(122.35,255.2,484),"Approaching car dealership exit") then return false end
@@ -2710,24 +2730,10 @@ end
 local buyerOutside=Vector3.new(-271.01,255.2,430)
 local buyerInside=Vector3.new(-271.01,255.2,402)
 local function crossBuyerDoor(token,entering)
-    -- Doors need physical contact before their native ownership/push handler runs.
-    -- Give that handler time instead of treating the closed door as a stuck wall.
     local approach=entering and Vector3.new(-271.01,255.2,422) or buyerInside
     if not moveTo(token,approach,entering and "Approaching fish shop door" or "Approaching shop exit") then return false end
-    local _,h,root=character()
-    if not h or not root then return false end
-    local target=entering and buyerInside or buyerOutside
-    h:MoveTo(target)
-    local deadline=os.clock()+8
-    while alive(token) and h.Health>0 and os.clock()<deadline do
-        updateTravelSprint()
-        local delta=root.Position-target
-        if Vector3.new(delta.X,0,delta.Z).Magnitude<3 and math.abs(delta.Y)<4 then Sprint.sprinting.set(false) return true end
-        task.wait(Config.ObstaclePollInterval)
-    end
-    Sprint.sprinting.set(false)
-    if alive(token) then error("Fish shop door did not open") end
-    return false
+    return crossDoor(token,approach,entering and buyerInside or buyerOutside,
+        entering and "Entering fish shop" or "Exiting fish shop")
 end
 local function approachFishBuyer(token,position)
     local _,_,root=character()
@@ -3358,27 +3364,9 @@ local function baitAmount(ammo)
     return amount
 end
 local function crossHardwareDoor(token,entering)
-    local _,hum,root=character()
-    if not hum or not root then return false end
-    local target=Vector3.new(entering and -110 or -89,255.5,133.2)
-    local wasTravelling=API.Travelling
-    API.Travelling=true
-    API.Transport="Running"
-    status(entering and "Entering hardware through public door" or "Exiting hardware through public door")
-    local deadline=os.clock()+8
-    local reached=false
-    repeat
-        if not alive(token) or hum.Health<=0 then break end
-        updateTravelSprint()
-        hum:MoveTo(target)
-        local delta=root.Position-target
-        if Vector3.new(delta.X,0,delta.Z).Magnitude<2.5 and math.abs(delta.Y)<4 then reached=true break end
-        task.wait(Config.ObstaclePollInterval)
-    until os.clock()>deadline
-    API.Travelling=wasTravelling
-    Sprint.sprinting.set(false)
-    if not reached and alive(token) then error("Hardware door crossing blocked; retrying through entrance") end
-    return reached
+    local outside,inside=Vector3.new(-89,255.5,133.2),Vector3.new(-110,255.5,133.2)
+    return crossDoor(token,entering and outside or inside,entering and inside or outside,
+        entering and "Entering hardware store" or "Exiting hardware store")
 end
 leaveHardware=function(token)
     if not walkingRoute(token,Vector3.new(-110,255.5,133.2),"Following hardware exit aisle") then return false end
