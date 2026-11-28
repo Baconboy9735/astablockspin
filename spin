@@ -19,6 +19,7 @@ getgenv().BlockSpinFishingConfig = {
     BootstrapWithStocker = true,
     StarterBaitAmount = 50,
     PrepareFullKitOnStart = true,
+    ReuseExistingStartupKit = true,
     AutoRetryErrors = true,
     RetryDelay = 5,
     MaxRetryDelay = 30,
@@ -49,18 +50,37 @@ getgenv().BlockSpinFishingConfig = {
     AutoLicense = true,
     ResumeAfterDeath = true,
     EnableDeepSea = true,
+    FishFromLakeCenter = true,
+    SkyFishing = true,
+    SkyFishingHeight = 55,
+    SkyTravelSpeed = 30,
+    SprintWhileSwimming = true,
     DeepSeaAnchor = nil, -- Optional: Vector3.new(X, Y, Z)
     VehicleSpeed = 42,
+    PreferOwnedCars = true,
+    CarMinTripDistance = 8,
+    CarNearbyDistance = 40,
+    CarFinalWalkDistance = 50,
+    VehicleCooldownMaxWait = 90,
+    UndergroundVehicleTravel = true,
+    UndergroundVehicleDepth = 12,
+    UndergroundVehicleSpeed = 80,
+    UndergroundVehicleAcceleration = 90,
+    UndergroundVehicleBraking = 100,
+    VehicleSurfaceDistance = 10,
+    VehicleDiveDuration = 0.65,
     BikeTurnSpeed = 18,
     BikeAgentRadius = 2.3,
     BikeMaxReplans = 5,
-    BikeFinalApproach = 12,
-    ScooterMinTripDistance = 35,
+    BikeFinalApproach = 6,
+    ScooterMinTripDistance = 8,
     ScooterNearbyDistance = 14,
     ScooterCooldownWait = 10,
     ObstaclePollInterval = 0.05,
     VaultDuration = 0.65,
-    ObstacleNoclip = true,
+    ObstacleNoclip = false,
+    AllowFootVault = false,
+    AllowGroundJump = false,
     NoclipDuration = 0.25,
     NoclipMaxDistance = 8,
     AutoClosePurchases = true,
@@ -595,6 +615,10 @@ local function character()
     local c = player.Character
     return c, c and c:FindFirstChildOfClass("Humanoid"), c and c:FindFirstChild("HumanoidRootPart")
 end
+local function validWorldPosition(p)
+    return p.X==p.X and p.Y==p.Y and p.Z==p.Z
+        and math.abs(p.X)<100000 and p.Y>-500 and p.Y<10000 and math.abs(p.Z)<100000
+end
 local function cancelOwnedCast()
     if ownedCast and activeRod and activeRod.Parent then
         pcall(netSend, "cancel_throw", activeRod)
@@ -865,6 +889,20 @@ API.Protection=(function()
 end)()
 
 
+local lakeSupport,lakeTravel,skyTravel,skyStop
+local function updateTravelSprint()
+    local stamina=Sprint.sprint_bar.get()
+    if stamina<0.05 then Sprint.sprinting.set(false)
+    elseif stamina>0.3 then Sprint.sprinting.set(true) end
+end
+local function updateSwimmingSprint()
+    if not Config.SprintWhileSwimming then Sprint.sprinting.set(false) return end
+    updateTravelSprint()
+end
+local function clearLakeSupport()
+    if lakeSupport then lakeSupport:Destroy() lakeSupport=nil end
+    API.AtLakeCenter=false
+end
 function API.Stop(message,retrying)
     if not retrying then API.ManualStopSerial=(API.ManualStopSerial or 0)+1 API.NextRetryAt=nil end
     if API.MovementCollisionRestore then API.MovementCollisionRestore() end
@@ -874,6 +912,8 @@ function API.Stop(message,retrying)
     API.Travelling = false
     Sprint.sprinting.set(false)
     if driveCleanup then driveCleanup() end
+    if skyStop then skyStop() end
+    clearLakeSupport()
     if API.EarningForRod and type(ShelfStocking.cancel_stocking)=="function" then pcall(ShelfStocking.cancel_stocking) end
     generation += 1
     cancelOwnedCast()
@@ -922,6 +962,7 @@ local function walkToSpot(token, destination, caption)
         end
     end
     local function jumpObstacle()
+        if not Config.AllowGroundJump then return end
         if h.FloorMaterial == Enum.Material.Air then return end
         h.Jump = true
         h:ChangeState(Enum.HumanoidStateType.Jumping)
@@ -1006,6 +1047,7 @@ local function walkToSpot(token, destination, caption)
         return false
     end
     local function vaultShortObstacle(direction)
+        if not Config.AllowFootVault then return false end
         if shortNoclip(direction) then return true end
         if os.clock()-lastVault<Config.VaultDuration+0.15 then return false end
         local params=RaycastParams.new()
@@ -1025,11 +1067,20 @@ local function walkToSpot(token, destination, caption)
         -- User-authorized obstacle flight: one short arc, always less than one second.
         local origin=root.Position
         local landing=Vector3.new(landingXZ.X,floor.Position.Y+h.HipHeight+root.Size.Y/2,landingXZ.Z)
+        local arcHeight=3.5
+        local clearance=OverlapParams.new()
+        clearance.FilterDescendantsInstances={c}
+        clearance.RespectCanCollide=true
+        for sample=1,9 do
+            local alpha=sample/10
+            local point=origin:Lerp(landing,alpha)+Vector3.new(0,math.sin(alpha*math.pi)*arcHeight,0)
+            if #workspace:GetPartBoundsInBox(CFrame.new(point),Vector3.new(2,4.8,2),clearance)>0 then return false end
+        end
         local started=os.clock()
         API.ObstacleFlights=(API.ObstacleFlights or 0)+1
         while alive(token) and os.clock()-started<Config.VaultDuration do
             local alpha=math.min((os.clock()-started)/Config.VaultDuration,1)
-            local point=origin:Lerp(landing,alpha)+Vector3.new(0,math.sin(alpha*math.pi)*12,0)
+            local point=origin:Lerp(landing,alpha)+Vector3.new(0,math.sin(alpha*math.pi)*arcHeight,0)
             root.CFrame=CFrame.lookAt(point,point+direction)
             root.AssemblyLinearVelocity=Vector3.zero
             RunService.Heartbeat:Wait()
@@ -1184,7 +1235,7 @@ local function walkToSpot(token, destination, caption)
         player:RequestStreamAroundAsync(root.Position+delta.Unit*math.min(100,delta.Magnitude),1)
         local agentHeight=math.clamp(math.ceil(c:GetExtentsSize().Y),5,9)
         local agentRadius=math.clamp(root.Size.X/2+0.2,1.2,2)
-        local path=Pathfinding:CreatePath({AgentRadius=agentRadius,AgentHeight=agentHeight,AgentCanJump=true,WaypointSpacing=6,Costs={Water=100000}})
+        local path=Pathfinding:CreatePath({AgentRadius=agentRadius,AgentHeight=agentHeight,AgentCanJump=Config.AllowGroundJump,AgentCanClimb=false,WaypointSpacing=6,Costs={Water=100000}})
         local computed=pcall(function() path:ComputeAsync(root.Position,destination) end)
         if not alive(token) then return false end
         local advanced=false
@@ -1232,7 +1283,19 @@ local function walkToSpot(token, destination, caption)
 end
 
 
-local walkingRoute = walkToSpot
+local footRoute=walkToSpot
+local function walkingRoute(token,destination,caption)
+    local wasTravelling,wasTransport=API.Travelling,API.Transport
+    API.Travelling=true
+    API.Transport="Running"
+    updateTravelSprint()
+    local ok,reached,why=pcall(footRoute,token,destination,caption)
+    API.Travelling=wasTravelling
+    API.Transport=wasTransport
+    Sprint.sprinting.set(false)
+    if not ok then error(reached) end
+    return reached,why
+end
 -- Road junctions observed during the original script's travel, plus map pier approaches.
 local roads = {
     Vector3.new(100,251,-660), Vector3.new(40,251,-577), Vector3.new(0,251,-350),
@@ -1300,28 +1363,70 @@ local function roadRoute(origin,destination)
     end
     return expanded
 end
+local function ownedTravelVehicle()
+    local found,foundType,blocked
+    local _,hum,root=character()
+    local spawned={}
+    if root then
+        for _,model in ipairs(workspace.Vehicles:GetChildren()) do
+            if model:GetAttribute("OwnerUserId")==player.UserId then
+                local guid=model:GetAttribute("ItemGUID")
+                local seat=model:FindFirstChild("DriverSeat",true)
+                if guid and seat and validWorldPosition(seat.Position) and (not seat.Occupant or seat.Occupant==hum) then
+                    spawned[guid]=(seat.Position-root.Position).Magnitude
+                end
+            end
+        end
+    end
+    for _,kind in ipairs({"car","bike"}) do
+        if kind=="car" and not Config.PreferOwnedCars then continue end
+        local nearby,nearDistance
+        Items.iterate_through_items_of_type(Data,kind,function(item)
+            if item.location=="hand" and not item.destroyed and (item.health or 1)>0
+                and (kind=="car" or item.name=="EScooter" or item.name=="BMX") then
+                local distance=spawned[item.guid]
+                local range=kind=="car" and Config.CarNearbyDistance or Config.ScooterNearbyDistance
+                if distance and distance<=range and (not nearDistance or distance<nearDistance) then
+                    nearby,nearDistance=item,distance
+                end
+                if kind=="car" and API.VehicleRetryAfter and (API.VehicleRetryAfter[item.guid] or 0)>os.clock() then
+                    blocked=blocked or item
+                    return
+                end
+                if not found or (item.health or 1)>(found.health or 1)
+                    or ((item.health or 1)==(found.health or 1) and item.name<found.name) then found,foundType=item,kind end
+            end
+        end)
+        if nearby then
+            API.VehicleSelectionReason="Nearby spawned vehicle"
+            return nearby,kind
+        end
+        API.VehicleSelectionReason="Inventory vehicle"
+        if found then return found,foundType end
+        if kind=="car" and blocked then return blocked,"car" end
+    end
+end
 local function tryOwnedTransport(token, destination)
     local c,h,root=character()
-    if not root or (root.Position-destination).Magnitude<Config.ScooterMinTripDistance or type(fireproximityprompt)~="function" then return false end
+    local owned,vehicleType=ownedTravelVehicle()
+    API.TransportTripResult="Unavailable"
+    if not root or not owned or type(fireproximityprompt)~="function" then return false end
+    if not validWorldPosition(root.Position) then API.LastTransportError="Character position is invalid" return false end
+    local minimum=vehicleType=="car" and Config.CarMinTripDistance or Config.ScooterMinTripDistance
+    if (root.Position-destination).Magnitude<minimum then return false end
     local function indoors(p)
         return (p.X>-170 and p.X<-98 and p.Z>96 and p.Z<174)
             or (p.X>-288 and p.X<-236 and p.Z>330 and p.Z<412)
             or (p.X>235 and p.X<276 and p.Z<-236 and p.Z>-292)
     end
-    if indoors(root.Position) or indoors(destination) then return false end
-    local owned
-    Items.iterate_through_items_of_type(Data,"bike",function(item)
-        if item.location=="hand" and (item.name=="EScooter" or item.name=="BMX") and not item.destroyed and (item.health or 1)>0 then
-            if not owned or item.name=="EScooter" then owned=item end
-        end
-    end)
-    if not owned then return false end
+    if indoors(root.Position) or indoors(destination) then API.TransportTripResult="Indoor" return false end
+    API.SelectedVehicle={Name=owned.name,Guid=owned.guid,Type=vehicleType,Reason=API.VehicleSelectionReason}
     API.Transport=owned.name
     status("Using inventory "..owned.name)
     local function findScooter()
         local fallback
         for _,v in ipairs(workspace.Vehicles:GetChildren()) do
-            if v:GetAttribute("OwnerUserId")==player.UserId then
+            if v:GetAttribute("OwnerUserId")==player.UserId and validWorldPosition(v:GetPivot().Position) then
                 local guid=v:GetAttribute("ItemGUID")
                 if guid==owned.guid then return v end
                 if not guid and v.Name==owned.name then fallback=v end
@@ -1339,17 +1444,35 @@ local function tryOwnedTransport(token, destination)
         return predicate()
     end
     local function toggleScooter(action)
-        local deadline=os.clock()+Config.ScooterCooldownWait
+        local deadline=os.clock()+(vehicleType=="car" and Config.VehicleCooldownMaxWait or Config.ScooterCooldownWait)
         repeat
             if not alive(token) then return false end
+            local nextSpawn=player:GetAttribute("SpawnVehicleNext")
+            if type(nextSpawn)=="number" and nextSpawn>workspace:GetServerTimeNow() then
+                status(owned.name.." cooldown: "..math.ceil(nextSpawn-workspace:GetServerTimeNow()).."s")
+                repeat
+                    task.wait(0.5)
+                    local candidate=ownedTravelVehicle()
+                    if candidate and candidate.guid~=owned.guid and API.VehicleSelectionReason=="Nearby spawned vehicle" then
+                        API.LastTransportError="Nearby owned vehicle became available; changing selection"
+                        return false
+                    end
+                until not alive(token) or workspace:GetServerTimeNow()>=nextSpawn or os.clock()>=deadline
+                if not alive(token) then return false end
+                if os.clock()>=deadline then API.LastTransportError="Waiting for vehicle spawn cooldown" return false end
+            end
             local accepted,reason=netGet("toggle_equip_item",owned.guid)
             API.LastVehicleReply={Action=action,Accepted=accepted,Reason=reason}
             if accepted then return true end
             if reason~="Cooldown" or os.clock()>=deadline then
                 API.LastTransportError=action.." rejected: "..tostring(reason)
+                if vehicleType=="car" and reason=="Cooldown" then
+                    API.VehicleRetryAfter=API.VehicleRetryAfter or {}
+                    API.VehicleRetryAfter[owned.guid]=os.clock()+30
+                end
                 return false
             end
-            status("EScooter cooldown - retrying "..action)
+            status(owned.name.." cooldown - retrying "..action)
             task.wait(1.5)
         until not alive(token)
         return false
@@ -1359,18 +1482,15 @@ local function tryOwnedTransport(token, destination)
     local existing=findScooter()
     local refreshed=false
     local existingSeat=existing and existing:FindFirstChild("DriverSeat",true)
-    if existing and ((existingSeat and existingSeat.Position or existing:GetPivot().Position)-root.Position).Magnitude>Config.ScooterNearbyDistance then
+    local nearby=vehicleType=="car" and Config.CarNearbyDistance or Config.ScooterNearbyDistance
+    if existing and ((existingSeat and existingSeat.Position or existing:GetPivot().Position)-root.Position).Magnitude>nearby then
         local driver=existingSeat
         if driver and driver.Occupant and driver.Occupant~=h then API.LastTransportError="Owned scooter is occupied" return false end
-        status("Despawning distant EScooter")
+        status("Despawning distant "..owned.name)
         if not toggleScooter("despawn") then
-            if not existingSeat or (existingSeat.Position-root.Position).Magnitude>100 then return false end
-            status("Vehicle cooldown - retrieving parked "..owned.name)
-            local toward=root.Position-existingSeat.Position
-            local approach=existingSeat.Position+(toward.Magnitude>0.1 and toward.Unit*5 or Vector3.new(0,0,5))
-            if not walkingRoute(token,approach,"Running to parked "..owned.name) then return false end
+            return false
         else
-            if not awaitVehicleState(function()return not existing.Parent end,3) then
+            if not awaitVehicleState(function()return not existing.Parent or not validWorldPosition(existing:GetPivot().Position) end,3) then
                 API.LastTransportError="Despawn not confirmed; spawn was not attempted"
                 return false
             end
@@ -1379,7 +1499,7 @@ local function tryOwnedTransport(token, destination)
         end
     end
     if not existing then
-        status("Spawning EScooter beside character")
+        status("Spawning "..owned.name.." beside character")
         if not toggleScooter("spawn") then return false end
         if not awaitVehicleState(function()return findScooter()~=nil end,3) then
             API.LastTransportError="Vehicle spawn not replicated"
@@ -1399,6 +1519,12 @@ local function tryOwnedTransport(token, destination)
     if (root.Position-seat.Position).Magnitude>10 then
         local toward=root.Position-seat.Position
         local approach=seat.Position+(toward.Magnitude>0.1 and toward.Unit*5 or Vector3.new(0,0,5))
+        if vehicleType=="car" then
+            local _,carSize=vehicle:GetBoundingBox()
+            local side=vehicle:GetPivot().RightVector*(carSize.X/2+2)
+            local a,b=seat.Position+side,seat.Position-side
+            approach=(a-root.Position).Magnitude<(b-root.Position).Magnitude and a or b
+        end
         local reached=walkingRoute(token,approach,"Running to owned "..owned.name)
         if not reached then return false end
     end
@@ -1457,10 +1583,12 @@ local function tryOwnedTransport(token, destination)
             chassis.AssemblyAngularVelocity=Vector3.zero
         end
     end
+    local undergroundRestore
     local cleaned=false
     local function cleanup()
         if cleaned then return end
         cleaned=true
+        if undergroundRestore then undergroundRestore() undergroundRestore=nil end
         brake()
         if seat.Parent then seat.ThrottleFloat=0 seat.SteerFloat=0 end
         controls:Enable()
@@ -1469,8 +1597,173 @@ local function tryOwnedTransport(token, destination)
     end
     driveCleanup=cleanup
     local function floorAt(position)
+        if not validWorldPosition(position) then return nil end
         local hit=workspace:Raycast(position+Vector3.new(0,8,0),Vector3.new(0,-24,0),groundParams)
         if hit and hit.Material~=Enum.Material.Water and hit.Normal.Y>0.7 then return hit.Position end
+    end
+    local function stepOutOfCar()
+        if vehicleType~="car" or not alive(token) or h.Health<=0 or h.SeatPart then return end
+        if not vehicle.Parent or not validWorldPosition(vehicle:GetPivot().Position) then return end
+        local pivot=vehicle:GetPivot()
+        local query=OverlapParams.new()
+        query.FilterDescendantsInstances={c}
+        query.RespectCanCollide=true
+        local height=math.max(5,h.HipHeight*2+root.Size.Y)
+        for _,side in ipairs({pivot.RightVector,-pivot.RightVector,pivot.LookVector,-pivot.LookVector}) do
+            local distance=(math.abs(side:Dot(pivot.RightVector))>0.5 and size.X or size.Z)/2+3
+            local point=pivot.Position+side*distance
+            local floor=floorAt(point)
+            if floor then
+                local center=floor+Vector3.new(0,height/2+0.15,0)
+                if #workspace:GetPartBoundsInBox(CFrame.new(center),Vector3.new(2.2,height,2.2),query)==0 then
+                    local standing=floor+Vector3.new(0,h.HipHeight+root.Size.Y/2+0.1,0)
+                    root.CFrame=CFrame.new(standing)*root.CFrame.Rotation
+                    root.AssemblyLinearVelocity=Vector3.zero
+                    logEvent("MOVE","Exited car beside vehicle")
+                    return
+                end
+            end
+        end
+        API.LastWarning="No clear position beside car for dismount"
+    end
+    if Config.UndergroundVehicleTravel and vehicleType=="car" then
+        local origin=vehicle:GetPivot()
+        local startFloor=floorAt(origin.Position)
+        local toward=Vector3.new(destination.X-origin.Position.X,0,destination.Z-origin.Position.Z)
+        toward=toward.Magnitude>0.1 and toward.Unit or Vector3.xAxis
+        local overlap=OverlapParams.new()
+        overlap.FilterDescendantsInstances={c,vehicle}
+        overlap.RespectCanCollide=true
+        local clearance=Vector3.new(math.max(3,size.X+0.5),math.max(6,size.Y+2),math.max(4,size.Z+0.5))
+        local function surfaceSpot(point)
+            local floor=floorAt(Vector3.new(point.X,destination.Y,point.Z))
+            if not floor then return nil end
+            local box=CFrame.new(floor+Vector3.new(0,clearance.Y/2+0.15,0))
+            if #workspace:GetPartBoundsInBox(box,clearance,overlap)>0 then return nil end
+            return Vector3.new(point.X,floor.Y+offset,point.Z),floor.Y
+        end
+        local exit,exitFloor
+        for _,distance in ipairs({Config.VehicleSurfaceDistance,15,25,35}) do
+            for _,angle in ipairs({0,45,-45,90,-90,135,-135,180}) do
+                local direction=CFrame.Angles(0,math.rad(angle),0):VectorToWorldSpace(-toward)
+                exit,exitFloor=surfaceSpot(destination+direction*distance)
+                if exit then break end
+            end
+            if exit then break end
+        end
+        if startFloor and exit then
+            local saved={}
+            local recovery=origin
+            local submerged=false
+            local restored=false
+            local function disableCollisions()
+                for _,model in ipairs({vehicle,c}) do
+                    for _,part in model:QueryDescendants("BasePart") do
+                        if saved[part]==nil then saved[part]=part.CanCollide end
+                        part.CanCollide=false
+                    end
+                end
+            end
+            undergroundRestore=function()
+                if restored then return end
+                restored=true
+                if submerged and vehicle.Parent and validWorldPosition(vehicle:GetPivot().Position) and h.Health>0 and not API.ProtectionActive then vehicle:PivotTo(recovery) end
+                for part,collide in pairs(saved) do if part.Parent then part.CanCollide=collide end end
+                API.UndergroundActive=false
+                API.UndergroundPhase="Idle"
+                brake()
+            end
+            local function phase(name)
+                API.UndergroundPhase=name
+                status(owned.name.." - "..name)
+                logEvent("MOVE","Underground vehicle: "..name)
+            end
+            local function moveFrame(position,direction)
+                assert(validWorldPosition(position) and direction.X==direction.X and direction.Magnitude>0.01,"Invalid vehicle movement frame")
+                disableCollisions()
+                vehicle:PivotTo(CFrame.lookAt(position,position+direction))
+                brake()
+                API.VehicleLocation={Guid=owned.guid,Position=tostring(seat.Position),Underground=true}
+            end
+            local function transition(target,duration)
+                local from=vehicle:GetPivot().Position
+                local begun=os.clock()
+                repeat
+                    if not alive(token) or h.Health<=0 or not seat.Parent or h.SeatPart~=seat then return false end
+                    local alpha=math.clamp((os.clock()-begun)/duration,0,1)
+                    moveFrame(from:Lerp(target,alpha),toward)
+                    if alpha>=1 then return true end
+                    RunService.Heartbeat:Wait()
+                until false
+            end
+            local depth=math.clamp(Config.UndergroundVehicleDepth,8,35)
+            local tunnelY=math.min(startFloor.Y,exitFloor)-depth
+            API.UndergroundActive=true
+            API.UndergroundExit=tostring(exit)
+            phase("Descending below ground")
+            submerged=true
+            local ok=transition(Vector3.new(origin.Position.X,tunnelY,origin.Position.Z),math.max(0.2,Config.VehicleDiveDuration))
+            if ok then
+                phase("Travelling below ground")
+                local distance=Vector3.new(exit.X-origin.Position.X,0,exit.Z-origin.Position.Z).Magnitude
+                local speed=math.clamp(Config.UndergroundVehicleSpeed,10,120)
+                local currentSpeed=math.min(20,speed)
+                local acceleration=math.max(10,Config.UndergroundVehicleAcceleration)
+                local braking=math.max(10,Config.UndergroundVehicleBraking)
+                local deadline=os.clock()+distance/speed*2+15
+                local previous,lastProgress=vehicle:GetPivot().Position,os.clock()
+                local lastRecovery=0
+                while alive(token) and h.Health>0 and seat.Parent and h.SeatPart==seat do
+                    local position=vehicle:GetPivot().Position
+                    if not validWorldPosition(position) then ok=false API.LastTransportError="Vehicle despawned or left valid world" break end
+                    local delta=Vector3.new(exit.X-position.X,0,exit.Z-position.Z)
+                    if delta.Magnitude<1 then break end
+                    if os.clock()>deadline or os.clock()-lastProgress>3 then ok=false API.LastTransportError="Underground vehicle made no progress" break end
+                    if (position-previous).Magnitude>2 then previous,lastProgress=position,os.clock() end
+                    local dt=math.min(RunService.Heartbeat:Wait(),0.05)
+                    if not alive(token) or h.SeatPart~=seat then ok=false break end
+                    local targetSpeed=math.min(speed,math.sqrt(2*braking*math.max(0,delta.Magnitude-1)))
+                    local rate=targetSpeed<currentSpeed and braking or acceleration
+                    currentSpeed+=math.clamp(targetSpeed-currentSpeed,-rate*dt,rate*dt)
+                    API.UndergroundCurrentSpeed=currentSpeed
+                    local nextPosition=position+delta.Unit*math.min(currentSpeed*dt,delta.Magnitude)
+                    -- Keep below lower terrain too, rather than breaking the surface mid-trip.
+                    local surface=workspace:Raycast(Vector3.new(nextPosition.X,math.max(startFloor.Y,exitFloor)+6,nextPosition.Z),Vector3.new(0,-100,0),groundParams)
+                    if surface then tunnelY=math.min(tunnelY,surface.Position.Y-depth) end
+                    local y=position.Y+math.clamp(tunnelY-position.Y,-20*dt,20*dt)
+                    moveFrame(Vector3.new(nextPosition.X,y,nextPosition.Z),delta.Unit)
+                    if os.clock()-lastRecovery>1 then
+                        local fallback=surfaceSpot(Vector3.new(nextPosition.X,destination.Y,nextPosition.Z))
+                        if fallback then recovery=CFrame.lookAt(fallback,fallback+toward) end
+                        lastRecovery=os.clock()
+                    end
+                end
+                ok=ok and alive(token) and h.Health>0 and seat.Parent~=nil and h.SeatPart==seat
+            end
+            if ok then
+                -- Recheck emergence clearance; another vehicle may have arrived meanwhile.
+                local checked=surfaceSpot(exit)
+                if checked then
+                    exit=checked
+                    phase("Surfacing near destination")
+                    ok=transition(exit,math.max(0.2,Config.VehicleDiveDuration))
+                    if ok then
+                        recovery=vehicle:GetPivot()
+                        submerged=false
+                        API.UndergroundTrips=(API.UndergroundTrips or 0)+1
+                        API.BikeRoutesCompleted=(API.BikeRoutesCompleted or 0)+1
+                        API.LastTransportError=nil
+                        API.TransportTripResult="Arrived"
+                        logEvent("MOVE","Underground trip complete; walking final approach")
+                    end
+                else ok=false API.LastTransportError="Vehicle exit became obstructed" end
+            end
+            cleanup()
+            task.wait(0.3)
+            stepOutOfCar()
+            return false
+        end
+        logEvent("MOVE","No clear underground exit; using ground route")
     end
     local halfWidth=math.clamp(size.X/2,0.85,1.35)
     clearDrive=function(a,b)
@@ -1526,6 +1819,7 @@ local function tryOwnedTransport(token, destination)
     local visits={}
     while alive(token) and seat.Parent and h.SeatPart==seat and index<=#points do
         local position=vehicle:GetPivot().Position
+        if not validWorldPosition(position) then API.LastTransportError="Vehicle despawned or left valid world" break end
         if Vector3.new(destination.X-position.X,0,destination.Z-position.Z).Magnitude<Config.BikeFinalApproach then arrived=true break end
         if os.clock()>tripDeadline then API.LastTransportError="Bike route timed out" break end
         local point=points[index]
@@ -1595,10 +1889,12 @@ local function tryOwnedTransport(token, destination)
     if alive(token) and h.SeatPart==seat and (arrived or index>#points) then
         API.BikeRoutesCompleted=(API.BikeRoutesCompleted or 0)+1
         API.LastTransportError=nil
+        API.TransportTripResult="Arrived"
         logEvent("MOVE","Bike route complete; walking final approach")
     end
     cleanup()
     task.wait(0.5)
+    stepOutOfCar()
     -- Walk/run the final approach; never drive through shop interiors or into water.
     return false
 end
@@ -1613,11 +1909,13 @@ local function crossBikeDoor(token,entering)
     status(entering and "Entering bike shop through public door" or "Exiting bike shop before spawning transport")
     local deadline=os.clock()+8
     repeat
+        updateTravelSprint()
         h:MoveTo(target)
         local delta=root.Position-target
-        if Vector3.new(delta.X,0,delta.Z).Magnitude<3 then return true end
+        if Vector3.new(delta.X,0,delta.Z).Magnitude<3 and math.abs(delta.Y)<4 then Sprint.sprinting.set(false) return true end
         task.wait(Config.ObstaclePollInterval)
     until not alive(token) or h.Health<=0 or os.clock()>deadline
+    Sprint.sprinting.set(false)
     return false
 end
 local function leaveBikeShop(token)
@@ -1630,6 +1928,14 @@ local function leaveBikeShop(token)
 end
 walkToSpot = function(token,destination,caption)
     destination=destination or API.Spot
+    if skyTravel then
+        local handled,reached,why=skyTravel(token,destination)
+        if handled then return reached,why end
+    end
+    if lakeTravel then
+        local handled,reached,why=lakeTravel(token,destination)
+        if handled then return reached,why end
+    end
     local _,_,travelRoot=character()
     API.Travelling=true
     if travelRoot and inBikeShop(travelRoot.Position) and not inBikeShop(destination) then
@@ -1644,7 +1950,7 @@ walkToSpot = function(token,destination,caption)
         end
     end
     local function inFishShop(point)
-        return point.X>-288 and point.X<-236 and point.Z>330 and point.Z<412
+        return point.X>-288 and point.X<-236 and point.Z>330 and point.Z<412 and point.Y>248 and point.Y<263
     end
     if leaveFishBuyer and travelRoot and inFishShop(travelRoot.Position) and not inFishShop(destination) then
         if not leaveFishBuyer(token) then return false,"Could not exit fish shop" end
@@ -1656,15 +1962,17 @@ walkToSpot = function(token,destination,caption)
             local _,hum,root=character()
             local deadline=os.clock()+math.max(60,(root.Position-target).Magnitude/7+40)
             local previous,bestProgress=root.Position,os.clock()
-            Sprint.sprinting.set(false)
             API.Transport="Swimming"
+            updateSwimmingSprint()
             while alive(token) and (Vector3.new(root.Position.X-target.X,0,root.Position.Z-target.Z)).Magnitude>5 do
                 status("Crossing to/from Deep Sea Island")
+                updateSwimmingSprint()
                 hum:MoveTo(target)
                 if (root.Position-previous).Magnitude>3 then previous,bestProgress=root.Position,os.clock() end
-                if hum.Health<=0 or os.clock()>deadline or os.clock()-bestProgress>15 then return false,"Island crossing blocked" end
+                if hum.Health<=0 or os.clock()>deadline or os.clock()-bestProgress>15 then Sprint.sprinting.set(false) return false,"Island crossing blocked" end
                 task.wait(0.4)
             end
+            Sprint.sprinting.set(false)
             return alive(token)
         end
         if API.OnIsland and (API.ZoneSkill~="DeepSeaIsland" or destination~=API.Spot) then
@@ -1676,6 +1984,11 @@ walkToSpot = function(token,destination,caption)
             if not API.OnIsland then
                 tryOwnedTransport(token,mainland)
                 if not alive(token) then return false end
+                local _,islandVehicleType=ownedTravelVehicle()
+                local _,_,islandRoadRoot=character()
+                if islandVehicleType and API.TransportTripResult~="Arrived" and islandRoadRoot and (islandRoadRoot.Position-mainland).Magnitude>8 then
+                    return false,API.LastTransportError or "Waiting for owned transport to reach island crossing"
+                end
                 local approached,why=walkingRoute(token,mainland,"Running to island crossing")
                 if not approached then return false,why end
                 local crossed,warning=crossWater(destination)
@@ -1685,6 +1998,18 @@ walkToSpot = function(token,destination,caption)
             return walkingRoute(token,destination,caption)
         end
         if tryOwnedTransport(token,destination) then return true end
+        local attempted=API.SelectedVehicle and API.SelectedVehicle.Guid
+        local alternate,alternateType=ownedTravelVehicle()
+        if alternateType=="car" and alternate.guid~=attempted and API.TransportTripResult~="Arrived" and API.TransportTripResult~="Indoor" then
+            logEvent("MOVE","Trying alternate owned car: "..alternate.name)
+            if tryOwnedTransport(token,destination) then return true end
+        end
+        local _,preferredType=ownedTravelVehicle()
+        local _,_,afterTransportRoot=character()
+        if preferredType and API.TransportTripResult~="Indoor" and API.TransportTripResult~="Arrived" and afterTransportRoot
+            and (afterTransportRoot.Position-destination).Magnitude>8 then
+            return false,API.LastTransportError or "Waiting for owned transport; walking fallback disabled"
+        end
         API.Transport="Running"
         local _,_,roadRoot=character()
         if roadRoot and (roadRoot.Position-destination).Magnitude>Config.FootRoadDistance then
@@ -1800,6 +2125,11 @@ local function moveTo(token, position, caption)
 end
 local function transfer(token, from, to, amount)
     if not alive(token) or amount <= 0 then return false end
+    if API.AtSkyFishing and skyTravel then
+        local handled,reached,why=skyTravel(token,API.Shore)
+        if handled and not reached then error(why or "Sky landing before banking failed") end
+        if not alive(token) then return false end
+    end
     local beforeHand, beforeBank = cash(), bank()
     status((from == "hand" and "Depositing $" or "Withdrawing purchase shortfall $") .. amount)
     local accepted, rejection = netGet("transfer_funds", from, to, amount)
@@ -1960,14 +2290,6 @@ local function recoverDeathDrops(token)
     if API.DeathRecovery==record then API.DeathRecovery=nil env.BlockSpinDeathRecovery=nil end
     return alive(token)
 end
-local function ownedTravelBike()
-    local found
-    Items.iterate_through_items_of_type(Data,"bike",function(item)
-        if item.location=="hand" and (item.name=="EScooter" or item.name=="BMX")
-            and not item.destroyed and (item.health or 1)>0 then found=item end
-    end)
-    return found
-end
 local bikeOfferCache
 local function bikeOffer(token)
     if bikeOfferCache and bikeOfferCache.Option:IsDescendantOf(workspace)
@@ -2002,7 +2324,7 @@ local function bikeOffer(token)
     return crate,chosen,price
 end
 local function ensureBike(token)
-    if not Config.AutoBuyBike or ownedTravelBike() then return true end
+    if not Config.AutoBuyBike or ownedTravelVehicle() then return true end
     if os.clock()-(API.LastBikePurchaseAttempt or -math.huge)<60 then
         API.BikePurchaseStatus="Waiting for bike purchase retry cooldown"
         return true
@@ -2040,10 +2362,10 @@ local function ensureBike(token)
     logEvent("BUY","Bike case request: "..tostring(accepted~=false and accepted~=nil).."; price="..price.."; reason="..tostring(reason))
     API.LastBikePurchaseReply={Accepted=accepted~=false and accepted~=nil,Reason=reason,Price=price}
     if accepted then
-        if waitFor(token,function()return ownedTravelBike()~=nil end,8) then
+        if waitFor(token,function()return ownedTravelVehicle()~=nil end,8) then
             API.BikesPurchased=(API.BikesPurchased or 0)+1
-            API.BikePurchaseStatus="Owned: "..ownedTravelBike().name
-            logEvent("BUY","Bike confirmed in inventory: "..ownedTravelBike().name)
+            API.BikePurchaseStatus="Owned: "..ownedTravelVehicle().name
+            logEvent("BUY","Bike confirmed in inventory: "..ownedTravelVehicle().name)
         else API.LastWarning="Bike purchase was accepted but inventory confirmation is pending" end
     else API.BikePurchaseStatus="Purchase rejected: "..tostring(reason) end
     if not alive(token) then return false end
@@ -2064,10 +2386,12 @@ local function crossBuyerDoor(token,entering)
     h:MoveTo(target)
     local deadline=os.clock()+8
     while alive(token) and h.Health>0 and os.clock()<deadline do
+        updateTravelSprint()
         local delta=root.Position-target
-        if Vector3.new(delta.X,0,delta.Z).Magnitude<3 then return true end
+        if Vector3.new(delta.X,0,delta.Z).Magnitude<3 and math.abs(delta.Y)<4 then Sprint.sprinting.set(false) return true end
         task.wait(Config.ObstaclePollInterval)
     end
+    Sprint.sprinting.set(false)
     if alive(token) then error("Fish shop door did not open") end
     return false
 end
@@ -2078,7 +2402,36 @@ local function approachFishBuyer(token,position)
         return moveTo(token,position,"Travelling to fish buyer")
     end
     local p=root.Position
-    local inside=p.X>-288 and p.X<-236 and p.Z>330 and p.Z<412
+    local footprint=p.X>-288 and p.X<-236 and p.Z>330 and p.Z<412
+    if footprint and p.Y>position.Y+8 then
+        local c,hum=character()
+        local floorParams=RaycastParams.new()
+        floorParams.FilterType=Enum.RaycastFilterType.Include
+        floorParams.FilterDescendantsInstances={workspace.Map,workspace.Terrain}
+        floorParams.RespectCanCollide=true
+        local space=OverlapParams.new()
+        space.FilterDescendantsInstances={c}
+        space.RespectCanCollide=true
+        local recovered=false
+        for _,point in ipairs({Vector3.new(-219,255.2,430),Vector3.new(-294,255.2,430),Vector3.new(-219,255.2,320)}) do
+            local floor=workspace:Raycast(point+Vector3.new(0,3,0),Vector3.new(0,-12,0),floorParams)
+            if floor and floor.Material~=Enum.Material.Water and floor.Normal.Y>0.7 then
+                local standing=floor.Position+Vector3.new(0,hum.HipHeight+root.Size.Y/2+0.1,0)
+                if #workspace:GetPartBoundsInBox(CFrame.new(standing),Vector3.new(2,4.8,2),space)==0 then
+                    hum:Move(Vector3.zero)
+                    root.CFrame=CFrame.new(standing)*root.CFrame.Rotation
+                    root.AssemblyLinearVelocity=Vector3.zero
+                    API.RoofRecoveries=(API.RoofRecoveries or 0)+1
+                    logEvent("MOVE","Recovered from fish shop roof to clear street entrance")
+                    recovered=true
+                    break
+                end
+            end
+        end
+        if not recovered then error("Fish shop roof recovery has no clear street position") end
+        p=root.Position
+    end
+    local inside=p.X>-288 and p.X<-236 and p.Z>330 and p.Z<412 and math.abs(p.Y-position.Y)<7
     if not inside then
         if (p-position).Magnitude>150 then
             if not moveTo(token,Vector3.new(-294,255.2,430),"Travelling to fish shop street entrance") then return false end
@@ -2096,12 +2449,10 @@ local function approachFishBuyer(token,position)
 end
 leaveFishBuyer=function(token)
     local _,_,root=character()
-    if root and root.Position.X>-288 and root.Position.X<-236 and root.Position.Z>330 and root.Position.Z<412 then
+    if root and root.Position.X>-288 and root.Position.X<-236 and root.Position.Z>330 and root.Position.Z<412 and root.Position.Y>248 and root.Position.Y<263 then
         if not crossBuyerDoor(token,false) then return false end
-        -- Clear the building before planning a long trip north; otherwise a fresh
-        -- route can cut straight back through its dining room and east wall.
-        if not walkingRoute(token,Vector3.new(-219,255.2,430),"Clearing fish shop patio") then return false end
-        return walkingRoute(token,Vector3.new(-219,255.2,320),"Following fish shop side alley")
+        -- Hand off to the owned vehicle as soon as we are outside the door.
+        return true
     end
     return alive(token)
 end
@@ -2255,7 +2606,7 @@ local function selectZone()
             API.LastWarning="Deep Sea requires the $2,500,000 fishing license"
         end
     end
-    if API.ZoneSkill == chosen.Skill then return end
+    if API.ZoneSkill == chosen.Skill and API.LastCenterMode==Config.FishFromLakeCenter and API.LastSkyMode==Config.SkyFishing then return end
     player:RequestStreamAroundAsync(chosen.Center,3)
     if chosen.Skill == "LilPond" then
         API.Spot, API.Water = Vector3.new(205.97638, 254.93259, -819.11719), Vector3.new(192.29074, 249.84375, -765.84711)
@@ -2278,10 +2629,384 @@ local function selectZone()
         rejectedZones[chosen.Skill]=true
         return selectZone()
     end
-    API.Spot = shore
-    API.Water=castWater
+    if not API.AtLakeCenter then clearLakeSupport() end
+    API.Shore=shore
+    local _,travelType=ownedTravelVehicle()
+    API.SkyFishing=Config.SkyFishing and travelType=="car" and chosen.Skill~="DeepSeaIsland"
+    API.CenterFishing=(Config.FishFromLakeCenter or API.SkyFishing) and chosen.Skill~="DeepSeaIsland"
+    API.LastCenterMode=Config.FishFromLakeCenter
+    API.LastSkyMode=Config.SkyFishing
+    if API.CenterFishing then
+        local center=API.Water
+        local _,hum,root=character()
+        API.CenterWater=center
+        API.Spot=center+Vector3.new(0,1.25+hum.HipHeight+root.Size.Y/2,0)
+        -- Cast away from the small support, while keeping the bobber in water.
+        local params=RaycastParams.new()
+        params.FilterType=Enum.RaycastFilterType.Include
+        params.FilterDescendantsInstances={workspace.Terrain}
+        params.IgnoreWater=false
+        local target
+        for _,distance in ipairs({18,12,8}) do
+            for _,direction in ipairs({Vector3.xAxis,-Vector3.xAxis,Vector3.zAxis,-Vector3.zAxis}) do
+                local hit=workspace:Raycast(center+direction*distance+Vector3.new(0,20,0),Vector3.new(0,-40,0),params)
+                if hit and hit.Material==Enum.Material.Water then target=hit.Position break end
+            end
+            if target then break end
+        end
+        if not target then error("No water around lake center for casting") end
+        API.Water=target
+        API.CastWater=target
+        if API.SkyFishing then
+            API.Spot=center+Vector3.new(0,math.clamp(Config.SkyFishingHeight,15,65),0)
+            API.Water=center+Vector3.new(4,2,0)
+            API.CastWater=center+Vector3.new(4,0,0)
+        end
+    else
+        API.Spot=shore
+        API.Water=castWater
+        API.CastWater=castWater
+        API.CenterWater=nil
+    end
     API.ZoneSkill, API.ZoneName = chosen.Skill, chosen.Name
     updateProgress()
+end
+lakeTravel=function(token,destination)
+    local _,hum,root=character()
+    if not hum or not root then return false end
+    local entering=API.CenterFishing and destination==API.Spot
+    local changingLake=API.AtLakeCenter and entering and API.ActiveLakeSpot~=API.Spot
+    local leaving=API.AtLakeCenter and (not entering or changingLake)
+    if not entering and not leaving then return false end
+    -- A failed swim retry can start with the character still on a parked car.
+    -- Move to a verified dry point outside its bounds before entering the water.
+    if entering then
+        for _,model in ipairs(workspace.Vehicles:GetChildren()) do
+            if model:GetAttribute("OwnerUserId")==player.UserId and validWorldPosition(model:GetPivot().Position) then
+                local box,size=model:GetBoundingBox()
+                local localPoint=box:PointToObjectSpace(root.Position)
+                if math.abs(localPoint.X)<size.X/2+1.5 and math.abs(localPoint.Z)<size.Z/2+1.5 and math.abs(localPoint.Y)<size.Y/2+5 then
+                    if hum.SeatPart then pcall(netGet,"exit_seat") hum.Sit=false task.wait(0.3) end
+                    local ground=RaycastParams.new()
+                    ground.FilterType=Enum.RaycastFilterType.Include
+                    ground.FilterDescendantsInstances={workspace.Map,workspace.Terrain}
+                    ground.RespectCanCollide=true
+                    local space=OverlapParams.new()
+                    space.FilterDescendantsInstances={player.Character}
+                    space.RespectCanCollide=true
+                    local best,bestScore
+                    for _,side in ipairs({box.RightVector,-box.RightVector,box.LookVector,-box.LookVector}) do
+                        local distance=(math.abs(side:Dot(box.RightVector))>0.5 and size.X or size.Z)/2+4
+                        local point=box.Position+side*distance
+                        local floor=workspace:Raycast(Vector3.new(point.X,API.Shore.Y+4,point.Z),Vector3.new(0,-20,0),ground)
+                        if floor and floor.Material~=Enum.Material.Water and floor.Normal.Y>0.7 then
+                            local standing=floor.Position+Vector3.new(0,hum.HipHeight+root.Size.Y/2+0.1,0)
+                            if #workspace:GetPartBoundsInBox(CFrame.new(standing),Vector3.new(2.2,4.8,2.2),space)==0 then
+                                local score=(standing-API.CenterWater).Magnitude
+                                if not bestScore or score<bestScore then best,bestScore=standing,score end
+                            end
+                        end
+                    end
+                    if not best then return true,false,"No clear swim entry beside parked vehicle" end
+                    hum:Move(Vector3.zero)
+                    root.CFrame=CFrame.new(best)*root.CFrame.Rotation
+                    root.AssemblyLinearVelocity=Vector3.zero
+                    hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+                    logEvent("MOVE","Cleared parked vehicle before swimming")
+                    task.wait(0.3)
+                end
+            end
+        end
+    end
+    local function overWater(position)
+        local params=RaycastParams.new()
+        params.FilterType=Enum.RaycastFilterType.Include
+        params.FilterDescendantsInstances={workspace.Terrain,workspace.Map}
+        params.RespectCanCollide=true
+        params.IgnoreWater=false
+        local hit=workspace:Raycast(position+Vector3.new(0,30,0),Vector3.new(0,-80,0),params)
+        return hit and hit.Material==Enum.Material.Water
+    end
+    if entering and not leaving and not overWater(root.Position) and (root.Position-API.Shore).Magnitude>8 then
+        local route=(root.Position-API.Shore).Magnitude<=30 and walkingRoute or walkToSpot
+        local ok,why=route(token,API.Shore,"Travelling to lake shore")
+        if not ok then return true,false,why end
+    end
+    local target=leaving and (API.LakeExitShore or API.Shore) or API.CenterWater
+    clearLakeSupport()
+    if hum.SeatPart then pcall(netGet,"exit_seat") hum.Sit=false task.wait(0.3) end
+    local deadline=os.clock()+math.max(30,(root.Position-target).Magnitude/5+15)
+    local previous,lastProgress=root.Position,os.clock()
+    API.Transport="Swimming"
+    status(not leaving and "Swimming to lake center" or "Returning from lake center to shore")
+    updateSwimmingSprint()
+    while alive(token) and hum.Health>0 do
+        local delta=Vector3.new(target.X-root.Position.X,0,target.Z-root.Position.Z)
+        if delta.Magnitude<3 then break end
+        updateSwimmingSprint()
+        hum:MoveTo(target)
+        if leaving and delta.Magnitude<10 and target.Y-root.Position.Y>2 then hum.Jump=true end
+        if (root.Position-previous).Magnitude>2 then previous,lastProgress=root.Position,os.clock() end
+        if os.clock()>deadline or os.clock()-lastProgress>8 then
+            Sprint.sprinting.set(false)
+            hum:Move(Vector3.zero)
+            return true,false,"Lake swimming route blocked"
+        end
+        task.wait(0.1)
+    end
+    Sprint.sprinting.set(false)
+    if not alive(token) or hum.Health<=0 then return true,false,"Lake movement cancelled" end
+    hum:Move(Vector3.zero)
+    if entering and not leaving then
+        lakeSupport=Instance.new("Part")
+        lakeSupport.Name="AutoFishingLakeSupport"
+        lakeSupport.Size=Vector3.new(7,0.5,7)
+        lakeSupport.Anchored=true
+        lakeSupport.Transparency=1
+        lakeSupport.CanTouch=false
+        lakeSupport.CanQuery=false
+        lakeSupport.Position=API.CenterWater+Vector3.new(0,1,0)
+        lakeSupport.Parent=workspace
+        root.CFrame=CFrame.new(API.Spot)*root.CFrame.Rotation
+        root.AssemblyLinearVelocity=Vector3.zero
+        hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+        API.AtLakeCenter=true
+        API.ActiveLakeSpot=API.Spot
+        API.LakeExitShore=API.Shore
+        logEvent("MOVE","Reached lake center: "..tostring(API.Spot))
+        task.wait(0.3)
+        return true,alive(token)
+    end
+    if changingLake then
+        local ok,why=walkToSpot(token,destination,"Travelling to newly unlocked lake center")
+        return true,ok,why
+    end
+    return false
+end
+do
+    local activeSky
+    local function skyRelease(state)
+        if state.Hold then state.Hold:Disconnect() state.Hold=nil end
+        if state.Platform then state.Platform:Destroy() state.Platform=nil end
+        for part,collide in pairs(state.Collisions) do
+            if part.Parent and (not part:IsDescendantOf(state.Car) or validWorldPosition(state.Car:GetPivot().Position)) then part.CanCollide=collide end
+        end
+        API.AtSkyFishing=false
+        API.AtLakeCenter=false
+        if activeSky==state then activeSky=nil end
+    end
+    local function skyStack(state,frame)
+        assert(state.Car.Parent and validWorldPosition(state.Car:GetPivot().Position),"Sky car left valid world")
+        assert(player.Character==state.Character and state.Humanoid.Health>0 and not API.ProtectionActive,"Sky movement cancelled")
+        assert(validWorldPosition(frame.Position),"Invalid sky target")
+        for part in pairs(state.Collisions) do
+            if part.Parent then
+                part.CanCollide=false
+                part.AssemblyLinearVelocity=Vector3.zero
+                part.AssemblyAngularVelocity=Vector3.zero
+            end
+        end
+        state.Car:PivotTo(frame)
+        local standing=frame:PointToWorldSpace(state.Roof)
+        state.Platform.Position=standing-Vector3.new(0,state.Feet+0.2,0)
+        state.Root.CFrame=CFrame.new(standing)*state.Rotation
+        state.Root.AssemblyLinearVelocity=Vector3.zero
+        API.VehicleLocation={Guid=state.Guid,Position=tostring(frame.Position),Sky=true}
+    end
+    local function skySlide(state,target,checkRunning)
+        local from=state.Car:GetPivot()
+        local duration=math.max(0.4,(from.Position-target.Position).Magnitude/math.clamp(Config.SkyTravelSpeed,10,50))
+        local begun=os.clock()
+        repeat
+            if checkRunning and not alive(state.Token) then return false end
+            local alpha=math.clamp((os.clock()-begun)/duration,0,1)
+            skyStack(state,from:Lerp(target,alpha))
+            if alpha>=1 then return true end
+            RunService.Heartbeat:Wait()
+        until false
+    end
+    local function skyLand(state)
+        if state.Hold then state.Hold:Disconnect() state.Hold=nil end
+        API.SkyState="Descending to shore"
+        status("Sky Fishing - descending gradually to shore")
+        pcall(function()player:RequestStreamAroundAsync(state.Shore,2)end)
+        local ray=RaycastParams.new()
+        ray.FilterType=Enum.RaycastFilterType.Include
+        ray.FilterDescendantsInstances={workspace.Map,workspace.Terrain}
+        ray.RespectCanCollide=true
+        local overlap=OverlapParams.new()
+        overlap.FilterDescendantsInstances={state.Character,state.Car,state.Platform}
+        overlap.RespectCanCollide=true
+        local landing
+        for _,distance in ipairs({15,30,45}) do
+            for i=0,7 do
+                local q=state.Shore+Vector3.new(math.cos(i*math.pi/4)*distance,0,math.sin(i*math.pi/4)*distance)
+                local hit=workspace:Raycast(q+Vector3.new(0,5,0),Vector3.new(0,-20,0),ray)
+                if hit and hit.Material~=Enum.Material.Water and hit.Normal.Y>0.7 then
+                    local box=CFrame.new(hit.Position+Vector3.new(0,state.Size.Y/2+0.2,0))
+                    if #workspace:GetPartBoundsInBox(box,state.Size+Vector3.new(1,0,1),overlap)==0 then
+                        landing=CFrame.new(q.X,hit.Position.Y+state.Bottom,q.Z)*state.CarRotation
+                        break
+                    end
+                end
+            end
+            if landing then break end
+        end
+        assert(landing,"No clear place to land sky vehicle")
+        local currentStanding=state.Car:GetPivot():PointToWorldSpace(state.Roof)
+        local underY=state.SurfaceY-4
+        local descentRoot=Vector3.new(currentStanding.X,underY,currentStanding.Z)
+        local descent=CFrame.new(descentRoot-state.CarRotation:VectorToWorldSpace(state.Roof))*state.CarRotation
+        assert(skySlide(state,descent,false),"Sky descent cancelled")
+        local landedStanding=landing:PointToWorldSpace(state.Roof)
+        local crossingRoot=Vector3.new(landedStanding.X,underY,landedStanding.Z)
+        local crossing=CFrame.new(crossingRoot-state.CarRotation:VectorToWorldSpace(state.Roof))*state.CarRotation
+        assert(skySlide(state,crossing,false),"Sky shore approach cancelled")
+        assert(skySlide(state,landing,false),"Sky landing cancelled")
+        local boxCenter=landing:PointToWorldSpace(state.BoxCenter)
+        local standing
+        for _,side in ipairs({landing.RightVector,-landing.RightVector,landing.LookVector,-landing.LookVector}) do
+            local offset=(math.abs(side:Dot(landing.RightVector))>0.5 and state.Size.X or state.Size.Z)/2+3
+            local point=boxCenter+side*offset
+            local hit=workspace:Raycast(Vector3.new(point.X,state.Shore.Y+5,point.Z),Vector3.new(0,-20,0),ray)
+            if hit and hit.Material~=Enum.Material.Water and hit.Normal.Y>0.7 then
+                local target=hit.Position+Vector3.new(0,state.Feet,0)
+                if #workspace:GetPartBoundsInBox(CFrame.new(target),Vector3.new(2.2,4.8,2.2),overlap)==0 then standing=target break end
+            end
+        end
+        assert(standing,"No clear dismount position after sky landing")
+        local from=state.Root.Position
+        local begun=os.clock()
+        repeat
+            assert(player.Character==state.Character and state.Humanoid.Health>0,"Character changed during landing")
+            local alpha=math.clamp((os.clock()-begun)/0.5,0,1)
+            state.Root.CFrame=CFrame.new(from:Lerp(standing,alpha))*state.Rotation
+            state.Root.AssemblyLinearVelocity=Vector3.zero
+            if alpha>=1 then break end
+            RunService.Heartbeat:Wait()
+        until false
+        skyRelease(state)
+        API.SkyState="Idle"
+        logEvent("MOVE","Sky Fishing landed beside car")
+    end
+    skyStop=function()
+        local state=activeSky
+        if not state or state.Landing then return end
+        state.Landing=true
+        env.BlockSpinSkyLanding=true
+        task.spawn(function()
+            local ok,err=pcall(skyLand,state)
+            if not ok then skyRelease(state) API.LastWarning="Sky landing: "..tostring(err) end
+            env.BlockSpinSkyLanding=nil
+        end)
+    end
+    skyTravel=function(token,destination)
+        local entering=API.SkyFishing and destination==API.Spot
+        if activeSky and (not entering or activeSky.Spot~=API.Spot) then
+            local state=activeSky
+            state.Landing=true
+            env.BlockSpinSkyLanding=true
+            local ok,err=pcall(skyLand,state)
+            env.BlockSpinSkyLanding=nil
+            if not ok then skyRelease(state) return true,false,tostring(err) end
+        end
+        if not entering then return false end
+        if activeSky then return true,true end
+        local c,h,root=character()
+        if not h or not root or not validWorldPosition(root.Position) then return true,false,"Character unavailable for sky fishing" end
+        local owned,kind=ownedTravelVehicle()
+        if kind~="car" then return true,false,"Sky Fishing requires an owned car" end
+        local function findCar()
+            for _,v in ipairs(workspace.Vehicles:GetChildren()) do
+                if v:GetAttribute("OwnerUserId")==player.UserId and v:GetAttribute("ItemGUID")==owned.guid and validWorldPosition(v:GetPivot().Position) then return v end
+            end
+        end
+        local car=findCar()
+        local lakeDistance=Vector3.new(root.Position.X-API.CenterWater.X,0,root.Position.Z-API.CenterWater.Z).Magnitude
+        if lakeDistance>80 or not car or (car:GetPivot().Position-root.Position).Magnitude>Config.CarNearbyDistance then
+            API.SkyState="Approaching shore by vehicle"
+            logEvent("MOVE","Driving to lake before starting sky ascent")
+            tryOwnedTransport(token,API.Shore)
+            if not alive(token) then return true,false,"Sky approach cancelled" end
+            if API.TransportTripResult~="Arrived" and (root.Position-API.Shore).Magnitude>Config.CarFinalWalkDistance then
+                return true,false,API.LastTransportError or "Waiting for vehicle to reach lake shore"
+            end
+            owned,kind=ownedTravelVehicle()
+            car=findCar()
+        end
+        if not car or (car:GetPivot().Position-root.Position).Magnitude>Config.CarNearbyDistance then return true,false,API.LastTransportError or "Waiting for nearby car for sky fishing" end
+        if h.SeatPart then pcall(netGet,"exit_seat") h.Sit=false task.wait(0.3) end
+        local seat=car:FindFirstChild("DriverSeat",true)
+        if not seat or seat.Occupant then return true,false,"Sky car is occupied" end
+        local frame=car:GetPivot()
+        local box,size=car:GetBoundingBox()
+        local template=Items.get_item_instance(owned.name)
+        if template then
+            local templateBox,templateSize=template:GetBoundingBox()
+            local relative=template:GetPivot():ToObjectSpace(templateBox)
+            box=frame*relative
+            size=templateSize
+        end
+        local feet=h.HipHeight+root.Size.Y/2+0.1
+        local boxLocal=frame:PointToObjectSpace(box.Position)
+        local roof=Vector3.new(boxLocal.X,boxLocal.Y+size.Y/2+feet+0.1,boxLocal.Z)
+        local platform=Instance.new("Part")
+        platform.Name="AutoFishingSkyCarPlatform"
+        platform.Size=Vector3.new(6,0.4,6)
+        platform.Anchored=true
+        platform.Transparency=1
+        platform.CanTouch=false
+        platform.CanQuery=false
+        platform.Position=frame:PointToWorldSpace(roof)-Vector3.new(0,feet+0.2,0)
+        platform.Parent=workspace
+        local state={Car=car,Guid=owned.guid,Character=c,Humanoid=h,Root=root,Feet=feet,Roof=roof,Platform=platform,
+            Size=size,BoxCenter=boxLocal,Bottom=frame.Position.Y-(box.Position.Y-size.Y/2)+0.1,
+            Rotation=root.CFrame.Rotation,CarRotation=frame.Rotation,Shore=API.Shore,SurfaceY=API.CenterWater.Y,Spot=API.Spot,Token=token,Collisions={}}
+        for _,model in ipairs({car,c}) do for _,part in model:QueryDescendants("BasePart") do state.Collisions[part]=part.CanCollide;part.CanCollide=false end end
+        activeSky=state
+        API.SkyState="Climbing onto car"
+        Sprint.sprinting.set(false)
+        h:Move(Vector3.zero)
+        local from=root.Position
+        local top=frame:PointToWorldSpace(roof)
+        local begun=os.clock()
+        local duration=math.max(0.5,(from-top).Magnitude/15)
+        repeat
+            if not alive(token) then return true,false,"Sky climb cancelled" end
+            local alpha=math.clamp((os.clock()-begun)/duration,0,1)
+            car:PivotTo(frame)
+            root.CFrame=CFrame.new(from:Lerp(top,alpha))*state.Rotation
+            root.AssemblyLinearVelocity=Vector3.zero
+            if alpha>=1 then break end
+            RunService.Heartbeat:Wait()
+        until false
+        if Vector3.new(root.Position.X-API.CenterWater.X,0,root.Position.Z-API.CenterWater.Z).Magnitude>3 then
+            API.SkyState="Approaching fishing point below water"
+            status("Moving below water to sky fishing point")
+            local underY=API.CenterWater.Y-4
+            local startStanding=state.Car:GetPivot():PointToWorldSpace(roof)
+            local underStart=Vector3.new(startStanding.X,underY,startStanding.Z)
+            local dive=CFrame.new(underStart-frame.Rotation:VectorToWorldSpace(roof))*frame.Rotation
+            if not skySlide(state,dive,true) then return true,false,"Lake approach cancelled" end
+            local underCenter=Vector3.new(API.CenterWater.X,underY,API.CenterWater.Z)
+            local crossing=CFrame.new(underCenter-frame.Rotation:VectorToWorldSpace(roof))*frame.Rotation
+            if not skySlide(state,crossing,true) then return true,false,"Lake approach cancelled" end
+        end
+        API.SkyState="Ascending"
+        status("Sky Fishing - ascending gradually")
+        local target=CFrame.new(API.Spot-frame.Rotation:VectorToWorldSpace(roof))*frame.Rotation
+        if not skySlide(state,target,true) then return true,false,"Sky ascent cancelled" end
+        API.SkyState="Fishing"
+        API.AtSkyFishing=true
+        API.AtLakeCenter=true
+        state.Hold=RunService.Heartbeat:Connect(function()
+            if activeSky~=state or state.Landing then return end
+            local ok,err=pcall(skyStack,state,target)
+            if not ok and API.Running then API.Retry("Sky hold failed: "..tostring(err)) end
+        end)
+        logEvent("MOVE","Sky Fishing ready at "..tostring(API.Spot))
+        return true,true
+    end
 end
 local function ownedRod(name)
     local found = false
@@ -2297,9 +3022,32 @@ local function baitAmount(ammo)
     end)
     return amount
 end
+local function crossHardwareDoor(token,entering)
+    local _,hum,root=character()
+    if not hum or not root then return false end
+    local target=Vector3.new(entering and -110 or -89,255.5,133.2)
+    local wasTravelling=API.Travelling
+    API.Travelling=true
+    API.Transport="Running"
+    status(entering and "Entering hardware through public door" or "Exiting hardware through public door")
+    local deadline=os.clock()+8
+    local reached=false
+    repeat
+        if not alive(token) or hum.Health<=0 then break end
+        updateTravelSprint()
+        hum:MoveTo(target)
+        local delta=root.Position-target
+        if Vector3.new(delta.X,0,delta.Z).Magnitude<2.5 and math.abs(delta.Y)<4 then reached=true break end
+        task.wait(Config.ObstaclePollInterval)
+    until os.clock()>deadline
+    API.Travelling=wasTravelling
+    Sprint.sprinting.set(false)
+    if not reached and alive(token) then error("Hardware door crossing blocked; retrying through entrance") end
+    return reached
+end
 leaveHardware=function(token)
     if not walkingRoute(token,Vector3.new(-110,255.5,133.2),"Following hardware exit aisle") then return false end
-    return walkingRoute(token,Vector3.new(-89,255.5,133.2),"Exiting hardware through public door")
+    return crossHardwareDoor(token,false)
 end
 local function purchase(token, name, quantity, totalCost)
     if totalCost <= 0 or cash() + bank() < totalCost then return false end
@@ -2312,9 +3060,9 @@ local function purchase(token, name, quantity, totalCost)
     end
     -- Enter through the hardware store's public double doors; do not target its roof.
     local _,_,shopRoot=character()
-    local inShop=shopRoot and shopRoot.Position.X>-170 and shopRoot.Position.X<-98 and shopRoot.Position.Z>96 and shopRoot.Position.Z<174
+    local inShop=shopRoot and shopRoot.Position.X>-170 and shopRoot.Position.X<-98 and shopRoot.Position.Z>96 and shopRoot.Position.Z<174 and shopRoot.Position.Y>248 and shopRoot.Position.Y<263
     if not inShop and not moveTo(token, Vector3.new(-89,255.5,133.2), "Running to hardware entrance") then return false end
-    if not moveTo(token, Vector3.new(-110,255.5,133.2), "Entering hardware store") then return false end
+    if not inShop and not crossHardwareDoor(token,true) then return false end
     if not moveTo(token, shop.Position, "Buying "..quantity.." x "..name) then return false end
     if not alive(token) then return false end
     local accepted, reason = netGet("purchase_consumable", shop, name, quantity)
@@ -2327,7 +3075,7 @@ local function purchase(token, name, quantity, totalCost)
     task.wait(0.4)
     if not alive(token) then return false end
     if not moveTo(token, Vector3.new(-110,255.5,133.2), "Leaving hardware counter") then return false end
-    if not moveTo(token, Vector3.new(-89,255.5,133.2), "Leaving hardware store") then return false end
+    if not crossHardwareDoor(token,false) then return false end
     return true
 end
 local function hasUsableRod()
@@ -2590,13 +3338,20 @@ local function ensureStarterRod(token)
 end
 local function ensureStartupKit(token)
     if not Config.PrepareFullKitOnStart then return ensureStarterRod(token) end
-    if API.StartupKitReady and hasUsableRod() and (not Config.AutoBuyBike or ownedTravelBike()) then return true end
+    if API.StartupKitReady and hasUsableRod() and (not Config.AutoBuyBike or ownedTravelVehicle()) then return true end
     if inventoryFull() and fishCount()>0 then if not sellFish(token) then return false end end
     local rod,bait=starterChoices()
     if not rod or not bait then error("Starter rod or bait definition is unavailable") end
+    if Config.ReuseExistingStartupKit and hasUsableRod() and (not Config.AutoBuyBike or ownedTravelVehicle()) and baitAmount(bait.Ammo)>0 then
+        API.StartupKitReady=true
+        API.DesiredRod,API.DesiredBait=rod.Name,bait.Name
+        API.Phase="Fishing"
+        logEvent("STARTUP","Reusing owned fishing kit; bait already available: "..bait.Name)
+        return true
+    end
     local targetBait=math.clamp(Config.StarterBaitAmount,1,50)
     local needRod=not hasUsableRod()
-    local needBike=Config.AutoBuyBike and not ownedTravelBike()
+    local needBike=Config.AutoBuyBike and not ownedTravelVehicle()
     local bikeCost=0
     if needBike then
         local _,option,price=bikeOffer(token)
@@ -2621,7 +3376,7 @@ local function ensureStartupKit(token)
     -- Buy transport first, so trips for the rod and bait can use the new bike.
     if needBike then
         if not ensureBike(token) then return false end
-        if not ownedTravelBike() then error("Bike not received: "..tostring(API.BikePurchaseStatus or API.LastWarning)) end
+        if not ownedTravelVehicle() then error("Bike not received: "..tostring(API.BikePurchaseStatus or API.LastWarning)) end
     end
     if not hasUsableRod() then
         if not purchase(token,rod.Name,1,rod.Cost) then error("Could not purchase startup fishing rod") end
@@ -2632,7 +3387,7 @@ local function ensureStartupKit(token)
         if not purchase(token,bait.Name,baitToBuy,baitToBuy*bait.Cost) then error("Could not purchase startup bait") end
         if not waitFor(token,function()return baitAmount(bait.Ammo)>=targetBait end,5) then error("Startup bait quantity not confirmed") end
     end
-    if not hasUsableRod() or (Config.AutoBuyBike and not ownedTravelBike()) or baitAmount(bait.Ammo)<targetBait then
+    if not hasUsableRod() or (Config.AutoBuyBike and not ownedTravelVehicle()) or baitAmount(bait.Ammo)<targetBait then
         error("Startup equipment changed before confirmation; rechecking requirements")
     end
     API.StartupKitReady=true
@@ -2751,6 +3506,8 @@ API.Snapshot = function()
         Running = API.Running, Status = API.Status, Error = API.LastError, Transport=API.Transport,
         Warning=API.LastWarning, License=Data.has_fishing_license==true, NextUnlock=API.NextUnlock,
         DeepSeaAvailable=API.DeepSeaAvailable,Spot=tostring(API.Spot),Water=tostring(API.Water),
+        CenterFishing=API.CenterFishing,AtLakeCenter=API.AtLakeCenter,Shore=tostring(API.Shore),
+        SkyFishing=API.SkyFishing,AtSkyFishing=API.AtSkyFishing or false,SkyState=API.SkyState or "Idle",
         ObstacleFlights=API.ObstacleFlights or 0,LastVaultDuration=API.LastVaultDuration,
         NoclipPasses=API.NoclipPasses or 0,NoclipActive=API.NoclipActive or false,
         MovementMode=API.MovementMode,MovementGoal=API.MovementGoal,
@@ -2767,7 +3524,11 @@ API.Snapshot = function()
         DropsCollected=API.DropsCollected or 0,DeathRecoveries=API.DeathRecoveries or 0,
         DeathLootPending=API.DeathRecovery~=nil,BikesPurchased=API.BikesPurchased or 0,BikePurchaseStatus=API.BikePurchaseStatus,
         TransportTrips=API.TransportTrips or 0,TransportError=API.LastTransportError,
+        SelectedVehicle=API.SelectedVehicle,TransportTripResult=API.TransportTripResult,
         BikeRoutesCompleted=API.BikeRoutesCompleted or 0,BikeDetours=API.BikeDetours or 0,BikeReplans=API.BikeReplans or 0,
+        UndergroundActive=API.UndergroundActive or false,UndergroundPhase=API.UndergroundPhase or "Idle",
+        UndergroundTrips=API.UndergroundTrips or 0,UndergroundExit=API.UndergroundExit,
+        UndergroundCurrentSpeed=API.UndergroundActive and API.UndergroundCurrentSpeed or 0,
         BikeWaypoint=API.BikeWaypoint,BikeBlockedPart=API.BikeBlockedPart,BikeRoadIssue=API.BikeRoadIssue,
         ScooterRefreshes=API.ScooterRefreshes or 0,ScooterSpawnDistance=API.LastScooterSpawnDistance,
         VehicleReply=API.LastVehicleReply,ObstaclePollInterval=Config.ObstaclePollInterval,
@@ -2845,6 +3606,7 @@ connections[#connections + 1] = RunService.Heartbeat:Connect(function()
 end)
 
 function API.Start()
+    if env.BlockSpinSkyLanding then status("Finishing gradual sky landing") return end
     Config.Enabled = true
     if os.clock()<(API.NextRetryAt or 0) then return end
     if API.ProtectionActive then return end
@@ -2912,7 +3674,7 @@ function API.Start()
                 if not ensureBike(token) then return end
                 if not alive(token) or not prepareEquipment(token) then return end
                 if inventoryFull() then continue end
-                if (root.Position - API.Spot).Magnitude > 10 then
+                if (root.Position - API.Spot).Magnitude > 10 or (API.CenterFishing and not API.AtLakeCenter) then
                     local arrived, why = walkToSpot(token)
                     if not arrived then if alive(token) then API.Retry(why or "Movement route blocked") end return end
                 end
@@ -2934,12 +3696,38 @@ function API.Start()
                     ownedCast = true
                     object.states.bobber_position.set(API.Water)
                     object.states.has_thrown.set(true)
-                    local accepted, message, reason = netGet("throw_rod", activeRod, API.Water)
+                    local accepted, message, reason
+                    if API.SkyFishing then
+                        local startIndex=(API.SkyCastIndex or 0)%2
+                        for attempt=0,1 do
+                            local index=(startIndex+attempt)%2
+                            local castWater=API.CenterWater+Vector3.new(index*4,0,0)
+                            API.CastWater=castWater
+                            API.Water=castWater+Vector3.new(0,2,0)
+                            object.states.bobber_position.set(API.Water)
+                            object.states.has_thrown.set(true)
+                            accepted,message,reason=netGet("throw_rod",activeRod,castWater)
+                            if accepted then API.SkyCastIndex=(index+1)%2 break end
+                            object.states.has_thrown.set(false)
+                            if not alive(token) then break end
+                            task.wait(0.25)
+                        end
+                    else
+                        accepted,message,reason=netGet("throw_rod",activeRod,API.CastWater or API.Water)
+                    end
                     API.LastCastResult={Accepted=accepted,Message=message,Reason=reason}
                     if not alive(token) then cancelOwnedCast() return end
                     if not accepted then
                         ownedCast = false
                         object.states.has_thrown.set(false)
+                        if API.SkyFishing then
+                            API.LastSkyCastRejected=true
+                            API.LastWarning="Sky cast rejected; returning to surface fishing in the same area"
+                            Config.SkyFishing=false
+                            API.ZoneSkill=nil
+                            selectZone()
+                            continue
+                        end
                         if API.ZoneSkill ~= "LilPond" then
                             rejectedZones[API.ZoneSkill] = true
                             API.ZoneSkill = nil
@@ -3003,3 +3791,4 @@ function API.Destroy()
 end
 logEvent("STARTUP","Initialization complete; Enabled="..tostring(Config.Enabled))
 if Config.Enabled then API.Start() end
+
