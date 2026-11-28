@@ -13,7 +13,7 @@ getgenv().BlockSpinFishingConfig = {
     StartupCheckInterval = 0.35,
     MovementStuckTime = 0.65,
     MovementNoProgressTime = 1.5,
-    MovementMaxStepDown = 12,
+    MovementMaxStepDown = 3,
     MovementLookAhead = 30,
     FootRoadDistance = 180,
     BootstrapWithStocker = true,
@@ -36,6 +36,9 @@ getgenv().BlockSpinFishingConfig = {
     StartupMaxPlayers = 6,
     PreferredServerMaxPlayers = 3,
     AutoBuyBike = true,
+    AutoBuyCarCrate = true,
+    CarCrateReserve = 0,
+    CarCrateRetryDelay = 60,
     BikePurchaseReserve = 100,
     AutoPickupDrops = true,
     LootRadius = 120,
@@ -62,7 +65,7 @@ getgenv().BlockSpinFishingConfig = {
     CarNearbyDistance = 40,
     CarFinalWalkDistance = 50,
     VehicleCooldownMaxWait = 90,
-    UndergroundVehicleTravel = true,
+    UndergroundVehicleTravel = false,
     UndergroundVehicleDepth = 12,
     UndergroundVehicleSpeed = 80,
     UndergroundVehicleAcceleration = 90,
@@ -84,6 +87,7 @@ getgenv().BlockSpinFishingConfig = {
     NoclipDuration = 0.25,
     NoclipMaxDistance = 8,
     AutoClosePurchases = true,
+    ShowStatusUI = true,
     LogStatus = true,
     LogHistoryLimit = 200,
 }
@@ -123,6 +127,129 @@ if env.BlockSpinAutoFishing then env.BlockSpinAutoFishing.Destroy() end
 local startup={Started=os.clock(),Clicks={},Cancelled=false,Completed=false}
 env.BlockSpinStartupChecker=startup
 startup.Logs=logHistory
+-- BEGIN STATUS OVERLAY
+-- Read-only status overlay: this file does not start, stop, or move the player.
+do
+    local uiEnv=getgenv()
+    if uiEnv.BlockSpinStatusUI then uiEnv.BlockSpinStatusUI.Destroy() end
+    local overlay={Closed=false}
+    uiEnv.BlockSpinStatusUI=overlay
+    function overlay.Destroy()
+        overlay.Closed=true
+        if overlay.Gui then overlay.Gui:Destroy() end
+        if uiEnv.BlockSpinStatusUI==overlay then uiEnv.BlockSpinStatusUI=nil end
+    end
+    local function describe(api,startup)
+        if not api then return "Loading script",startup and startup.Phase or "Waiting for initialization",false end
+        local raw=tostring(api.Status or "Ready")
+        local lower=raw:lower()
+        if uiEnv.BlockSpinSkyLanding then return "Landing from Sky Fishing",raw,true end
+        if not api.Running then
+            local retry=math.max(0,math.ceil((api.NextRetryAt or 0)-os.clock()))
+            if api.Config and api.Config.Enabled and api.NextRetryAt then
+                return "Retrying in "..retry.."s",tostring(api.LastRetryReason or raw),true
+            end
+            return "Script stopped",raw,false
+        end
+        if lower:find("cooldown",1,true) then
+            local nextSpawn=game:GetService("Players").LocalPlayer:GetAttribute("SpawnVehicleNext")
+            if type(nextSpawn)=="number" then
+                local remaining=math.max(0,math.ceil(nextSpawn-workspace:GetServerTimeNow()))
+                return "Vehicle cooldown: "..remaining.."s",raw,true
+            end
+        end
+        local rules={
+            {"cooldown","Waiting for vehicle cooldown"},
+            {"quick11","Heading to Stocker"},
+            {"stock room","Collecting a stock box"},
+            {"stocker equipment funds","Earning money at Stocker"},
+            {"stocking shelf","Stocking shelves"},
+            {"assigned shelf","Heading to assigned shelf"},
+            {"stock","Working as Stocker"},
+            {"withdrawing","Withdrawing purchase funds"},
+            {"deposit","Depositing cash"},
+            {"atm","Heading to ATM"},
+            {"selling fish","Selling fish"},
+            {"sell fish","Heading to sell fish"},
+            {"fish buyer","Approaching fish buyer"},
+            {"car crate","Heading to car crate"},
+            {"dealership","At the car dealership"},
+            {"buying","Buying fishing supplies"},
+            {"hardware","Heading to hardware store"},
+            {"despawning","Despawning distant vehicle"},
+            {"spawning","Spawning vehicle"},
+            {"using inventory","Boarding vehicle"},
+            {"descending below ground","Descending below ground"},
+            {"travelling below ground","Driving below ground"},
+            {"surfacing","Surfacing near destination"},
+            {"descending gradually","Landing from Sky Fishing"},
+            {"ascending gradually","Ascending for Sky Fishing"},
+            {"below water","Approaching fishing spot underwater"},
+            {"swimming","Swimming to fishing spot or shore"},
+            {"reeling","Reeling in fish"},
+            {"waiting for a bite","Fishing - waiting for a bite"},
+            {"casting","Casting fishing rod"},
+            {"respawn","Waiting to respawn"},
+            {"loading","Waiting for game to load"},
+            {"entrance","Approaching shop entrance"},
+            {"exit","Leaving shop"},
+        }
+        for _,rule in ipairs(rules) do
+            if lower:find(rule[1],1,true) then return rule[2],raw,lower:find("cooldown",1,true)~=nil end
+        end
+        return "Script running",raw,false
+    end
+    task.spawn(function()
+        local player=game:GetService("Players").LocalPlayer
+        local parent=player:WaitForChild("PlayerGui",15)
+        if not parent or overlay.Closed then return end
+        local gui=Instance.new("ScreenGui")
+        gui.Name="BlockSpinFishingStatus"
+        gui.ResetOnSpawn=false
+        gui.DisplayOrder=100
+        gui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+        overlay.Gui=gui
+        local panel=Instance.new("Frame")
+        panel.Name="Panel"
+        panel.AnchorPoint=Vector2.new(.5,0)
+        panel.Position=UDim2.new(.5,0,0,12)
+        panel.Size=UDim2.fromOffset(340,118)
+        panel.BackgroundColor3=Color3.fromRGB(20,25,34)
+        panel.BackgroundTransparency=.08
+        panel.BorderSizePixel=0
+        panel.Parent=gui
+        local corner=Instance.new("UICorner");corner.CornerRadius=UDim.new(0,10);corner.Parent=panel
+        local border=Instance.new("UIStroke");border.Color=Color3.fromRGB(65,78,96);border.Transparency=.3;border.Parent=panel
+        local dot=Instance.new("Frame")
+        dot.Name="Indicator";dot.Size=UDim2.fromOffset(8,8);dot.Position=UDim2.fromOffset(14,17);dot.BorderSizePixel=0;dot.Parent=panel
+        local round=Instance.new("UICorner");round.CornerRadius=UDim.new(1,0);round.Parent=dot
+        local function label(name,y,height,size,color)
+            local text=Instance.new("TextLabel")
+            text.Name=name;text.Position=UDim2.fromOffset(14,y);text.Size=UDim2.new(1,-28,0,height)
+            text.BackgroundTransparency=1;text.BorderSizePixel=0;text.Font=Enum.Font.GothamMedium
+            text.TextSize=size;text.TextColor3=color;text.TextXAlignment=Enum.TextXAlignment.Left
+            text.TextYAlignment=Enum.TextYAlignment.Center;text.TextWrapped=true;text.RichText=false;text.Parent=panel
+            return text
+        end
+        local title=label("Title",9,22,12,Color3.fromRGB(164,180,201));title.Text="SCRIPT STATUS";title.Position=UDim2.fromOffset(30,9);title.Size=UDim2.new(1,-44,0,22)
+        local state=label("State",36,30,18,Color3.fromRGB(239,245,255))
+        local detail=label("Detail",74,32,11,Color3.fromRGB(164,180,201))
+        detail.TextXAlignment=Enum.TextXAlignment.Left
+        gui.Parent=parent
+        while not overlay.Closed and gui.Parent and uiEnv.BlockSpinStatusUI==overlay do
+            local api=uiEnv.BlockSpinAutoFishing
+            local config=uiEnv.BlockSpinFishingConfig or {}
+            gui.Enabled=config.ShowStatusUI~=false
+            local phase,reason,waiting=describe(api,uiEnv.BlockSpinStartupChecker)
+            if state.Text~=phase then state.Text=phase end
+            if detail.Text~=reason then detail.Text=reason end
+            dot.BackgroundColor3=waiting and Color3.fromRGB(255,188,73) or (api and api.Running and Color3.fromRGB(74,211,145) or Color3.fromRGB(147,160,179))
+            task.wait(.25)
+        end
+    end)
+end
+
+-- END STATUS OVERLAY
 logEvent("STARTUP","Script loaded; checking loading, Play and Skip")
 task.spawn(function()
     local names={
@@ -1383,7 +1510,7 @@ local function ownedTravelVehicle()
         local nearby,nearDistance
         Items.iterate_through_items_of_type(Data,kind,function(item)
             if item.location=="hand" and not item.destroyed and (item.health or 1)>0
-                and (kind=="car" or item.name=="EScooter" or item.name=="BMX") then
+                and (kind=="car" or kind=="bike") then
                 local distance=spawned[item.guid]
                 local range=kind=="car" and Config.CarNearbyDistance or Config.ScooterNearbyDistance
                 if distance and distance<=range and (not nearDistance or distance<nearDistance) then
@@ -1418,6 +1545,7 @@ local function tryOwnedTransport(token, destination)
         return (p.X>-170 and p.X<-98 and p.Z>96 and p.Z<174)
             or (p.X>-288 and p.X<-236 and p.Z>330 and p.Z<412)
             or (p.X>235 and p.X<276 and p.Z<-236 and p.Z>-292)
+            or (p.X>55 and p.X<165 and p.Z>476 and p.Z<580 and p.Y>248 and p.Y<263)
     end
     if indoors(root.Position) or indoors(destination) then API.TransportTripResult="Indoor" return false end
     API.SelectedVehicle={Name=owned.name,Guid=owned.guid,Type=vehicleType,Reason=API.VehicleSelectionReason}
@@ -1898,7 +2026,7 @@ local function tryOwnedTransport(token, destination)
     -- Walk/run the final approach; never drive through shop interiors or into water.
     return false
 end
-local leaveFishBuyer,leaveHardware
+local leaveFishBuyer,leaveHardware,leaveCarDealer
 local function inBikeShop(point)
     return point.X>235 and point.X<276 and point.Z<-236 and point.Z>-292
 end
@@ -1928,14 +2056,6 @@ local function leaveBikeShop(token)
 end
 walkToSpot = function(token,destination,caption)
     destination=destination or API.Spot
-    if skyTravel then
-        local handled,reached,why=skyTravel(token,destination)
-        if handled then return reached,why end
-    end
-    if lakeTravel then
-        local handled,reached,why=lakeTravel(token,destination)
-        if handled then return reached,why end
-    end
     local _,_,travelRoot=character()
     API.Travelling=true
     if travelRoot and inBikeShop(travelRoot.Position) and not inBikeShop(destination) then
@@ -1954,6 +2074,20 @@ walkToSpot = function(token,destination,caption)
     end
     if leaveFishBuyer and travelRoot and inFishShop(travelRoot.Position) and not inFishShop(destination) then
         if not leaveFishBuyer(token) then return false,"Could not exit fish shop" end
+    end
+    local function inDealer(p)
+        return p.X>55 and p.X<165 and p.Z>476 and p.Z<580 and p.Y>248 and p.Y<263
+    end
+    if leaveCarDealer and travelRoot and inDealer(travelRoot.Position) and not inDealer(destination) then
+        if not leaveCarDealer(token) then return false,"Could not exit car dealership" end
+    end
+    if skyTravel then
+        local handled,reached,why=skyTravel(token,destination)
+        if handled then return reached,why end
+    end
+    if lakeTravel then
+        local handled,reached,why=lakeTravel(token,destination)
+        if handled then return reached,why end
     end
     API.Travelling = true
     local ok, reached, reason = pcall(function()
@@ -2312,7 +2446,7 @@ local function bikeOffer(token)
                 local cost=option:GetAttribute("price")
                 if ok and type(cost)=="number" and cost>0 and (not definition.purchase_type or definition.purchase_type=="money") then
                     local valid=#(definition.items or {})>0
-                    for _,item in ipairs(definition.items or {}) do
+                    for _,item in ipairs(entries) do
                         if item.item_type~="bike" or (item.name~="BMX" and item.name~="EScooter") then valid=false end
                     end
                     if valid and (not price or cost<price) then chosen,price=option,cost end
@@ -2373,6 +2507,187 @@ local function ensureBike(token)
     return moveTo(token,outside,"Exiting bike shop")
 end
 -- The mainland buyer is indoors; enter through the south double door.
+local function crossCarDealerDoor(token,entering)
+    local _,hum,root=character()
+    if not hum or not root then return false end
+    local target=Vector3.new(122.35,255.2,entering and 484 or 440)
+    status(entering and "Entering car dealership through front door" or "Leaving car dealership through front door")
+    local deadline=os.clock()+8
+    repeat
+        if not alive(token) or hum.Health<=0 then break end
+        updateTravelSprint()
+        hum:MoveTo(target)
+        local delta=root.Position-target
+        if Vector3.new(delta.X,0,delta.Z).Magnitude<2.5 and math.abs(delta.Y)<4 then Sprint.sprinting.set(false) return true end
+        task.wait(Config.ObstaclePollInterval)
+    until os.clock()>deadline
+    Sprint.sprinting.set(false)
+    if alive(token) then error("Car dealership front door is blocked") end
+    return false
+end
+leaveCarDealer=function(token)
+    if not walkingRoute(token,Vector3.new(122.35,255.2,484),"Approaching car dealership exit") then return false end
+    return crossCarDealerDoor(token,false)
+end
+local function hasUsableCar()
+    local found
+    Items.iterate_through_items_of_type(Data,"car",function(item)
+        if item.location=="hand" and not item.destroyed and (item.health or 1)>0 then found=item end
+    end)
+    return found
+end
+local function gainedCrateVehicle(before)
+    local award,kind
+    for _,itemType in ipairs({"car","bike"}) do
+        Items.iterate_through_items_of_type(Data,itemType,function(item)
+            if item.location=="hand" and not before[item.guid] then award,kind=item,itemType end
+        end)
+        if award then return award,kind end
+    end
+end
+local carCrateCache,carCrateScanAt
+local function findCarCrate(token)
+    if carCrateCache and carCrateCache.Option:IsDescendantOf(workspace) and carCrateCache.Touch:IsDescendantOf(workspace)
+        and carCrateCache.Option:GetAttribute("disabled")~=true and os.clock()-carCrateCache.Time<30 then return carCrateCache end
+    if carCrateScanAt and os.clock()-carCrateScanAt<30 then return nil end
+    carCrateScanAt=os.clock()
+    local function scan()
+        local best
+        local tiles=workspace.Map:FindFirstChild("Tiles")
+        local tile=tiles and tiles:FindFirstChild("PrestigeDealerAndHousing")
+        local dealer=tile and tile:FindFirstChild("PrestigeCarDealer")
+        if not dealer then return nil end
+        for _,folder in ipairs(dealer:QueryDescendants("#CrateOptions")) do
+            local crate=folder.Parent
+            local beacon=crate:FindFirstChild("Beacon")
+            local touch=beacon and beacon:FindFirstChild("TouchPart")
+            if touch and touch:IsA("BasePart") then
+                for _,option in ipairs(folder:GetChildren()) do
+                    local cost=option:GetAttribute("price")
+                    if option:IsA("ModuleScript") and option:GetAttribute("disabled")~=true and type(cost)=="number" and cost>0 then
+                        local ok,definition=pcall(require,option)
+                        if ok and type(definition)=="table" and (not definition.purchase_type or definition.purchase_type=="money") then
+                            local entries=type(definition.items)=="table" and definition.items or {}
+                            local allVehicles=#entries>0
+                            local hasCar=false
+                            for _,item in ipairs(entries) do
+                                if type(item)~="table" or (item.item_type~="car" and item.item_type~="bike") then allVehicles=false break end
+                                if item.item_type=="car" then hasCar=true end
+                            end
+                            if allVehicles and hasCar and (not best or cost<best.Price) then
+                                best={Crate=crate,Option=option,Touch=touch,Price=cost,Time=os.clock()}
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        return best
+    end
+    local offer=scan()
+    if not offer then
+        -- Stream named dealership tiles without moving the character.
+        local tiles=workspace.Map:FindFirstChild("Tiles")
+        if tiles then
+            for _,tile in ipairs(tiles:GetChildren()) do
+                local name=tile.Name:lower()
+                if tile:IsA("Model") and (name:find("dealer") or name:find("vehicle") or name:find("carshop") or name:find("showroom")) then
+                    if not alive(token) then return nil end
+                    pcall(function()player:RequestStreamAroundAsync(tile:GetPivot().Position,2)end)
+                end
+            end
+            offer=scan()
+        end
+    end
+    carCrateCache=offer
+    return offer
+end
+local function ensureCarCrate(token)
+    if not Config.AutoBuyCarCrate then return true end
+    local car=hasUsableCar()
+    if car then
+        API.CarCrateStatus="Owned: "..car.name
+        env.BlockSpinCarCratePending=nil
+        return true
+    end
+    local pending=env.BlockSpinCarCratePending
+    if pending and pending.JobId==game.JobId then
+        local award,kind=gainedCrateVehicle(pending.Before or {})
+        if not award then API.CarCrateStatus="Waiting for crate inventory confirmation; no second purchase" return true end
+        env.BlockSpinCarCratePending=nil
+        API.NextCarCrateAttempt=os.clock()+Config.CarCrateRetryDelay
+        API.CarCrateStatus="Crate awarded "..kind..": "..award.name
+        return true
+    end
+    if os.clock()<(API.NextCarCrateAttempt or 0) then return true end
+    local offer=findCarCrate(token)
+    if not alive(token) then return false end
+    if not offer then API.CarCrateStatus="Car crate not streamed; checking again later" return true end
+    local price=offer.Price
+    API.CarCratePrice=price
+    local funds=cash()+(Config.AllowPurchaseWithdrawals and bank() or 0)
+    if funds<price+Config.CarCrateReserve then
+        API.CarCrateStatus="Saving for car crate: $"..funds.." / $"..(price+Config.CarCrateReserve)
+        return true
+    end
+    if inventoryFull(true) then API.CarCrateStatus="Waiting for inventory space before car crate" return true end
+    API.NextCarCrateAttempt=os.clock()+Config.CarCrateRetryDelay
+    if cash()<price and not transfer(token,"bank","hand",price-cash()) then return false end
+    API.CarCrateStatus="Travelling to car crate"
+    logEvent("BUY","Car crate selected: "..offer.Crate.Name.." / "..offer.Option.Name.."; $"..price)
+    local _,_,crateRoot=character()
+    if not crateRoot then return false end
+    local p=crateRoot.Position
+    local inDealer=p.X>55 and p.X<165 and p.Z>476 and p.Z<580 and p.Y>248 and p.Y<263
+    if not inDealer then
+        if not moveTo(token,Vector3.new(122.35,255.2,440),"Travelling to public car dealership entrance") then return false end
+        if not crossCarDealerDoor(token,true) then return false end
+    end
+    if not walkingRoute(token,offer.Touch.Position,"Approaching car crate interaction point") then return false end
+    if not alive(token) then return false end
+    if not offer.Option:IsDescendantOf(workspace) or offer.Option:GetAttribute("disabled")==true or offer.Option:GetAttribute("price")~=price then
+        carCrateCache=nil
+        API.CarCrateStatus="Car crate changed; checking price again"
+        return true
+    end
+    if hasUsableCar() then return true end
+    if cash()<price or inventoryFull(true) then API.CarCrateStatus="Funds or inventory changed before purchase" return true end
+    local _,_,root=character()
+    if not root or (root.Position-offer.Touch.Position).Magnitude>math.max(10,offer.Touch.Size.Magnitude/2+3) then
+        API.CarCrateStatus="Not within car crate interaction range"
+        return true
+    end
+    local before={}
+    for _,kind in ipairs({"car","bike"}) do Items.iterate_through_items_of_type(Data,kind,function(item)before[item.guid]=true end) end
+    local accepted,reason=netGet("open_crate",offer.Option,"money")
+    API.LastCarCrateReply={Accepted=accepted~=nil and accepted~=false,Reason=reason,Price=price}
+    if not accepted then
+        API.CarCrateStatus="Car crate rejected: "..tostring(reason)
+        logEvent("WARN",API.CarCrateStatus)
+        return leaveCarDealer(token)
+    end
+    env.BlockSpinCarCratePending={JobId=game.JobId,Price=price,Time=os.clock(),Before=before}
+    if not waitFor(token,function()return gainedCrateVehicle(before)~=nil end,8) then
+        API.CarCrateStatus="Purchase accepted; awaiting vehicle in inventory"
+        return alive(token) and leaveCarDealer(token)
+    end
+    local award,awardType=gainedCrateVehicle(before)
+    API.LastCarCrateAward={Name=award.name,Type=awardType,Guid=award.guid}
+    car=hasUsableCar()
+    env.BlockSpinCarCratePending=nil
+    API.CarCratesPurchased=(API.CarCratesPurchased or 0)+1
+    if not car then
+        API.CarCrateStatus="Crate awarded "..awardType..": "..award.name.."; retrying for car when funds allow"
+        logEvent("BUY",API.CarCrateStatus)
+        return leaveCarDealer(token)
+    end
+    API.CarCrateStatus="Owned: "..car.name
+    API.ZoneSkill=nil
+    API.LastSkyMode=nil
+    API.NextCarCrateAttempt=nil
+    logEvent("BUY","Car confirmed in inventory: "..car.name.."; car transport and Sky Fishing now available")
+    return leaveCarDealer(token)
+end
 local buyerOutside=Vector3.new(-271.01,255.2,430)
 local buyerInside=Vector3.new(-271.01,255.2,402)
 local function crossBuyerDoor(token,entering)
@@ -3337,6 +3652,7 @@ local function ensureStarterRod(token)
     return true
 end
 local function ensureStartupKit(token)
+    if not ensureCarCrate(token) then return false end
     if not Config.PrepareFullKitOnStart then return ensureStarterRod(token) end
     if API.StartupKitReady and hasUsableRod() and (not Config.AutoBuyBike or ownedTravelVehicle()) then return true end
     if inventoryFull() and fishCount()>0 then if not sellFish(token) then return false end end
@@ -3373,8 +3689,9 @@ local function ensureStartupKit(token)
         if not earnStarterFunds(token,target) then return false end
     end
     if not alive(token) then return false end
-    -- Buy transport first, so trips for the rod and bait can use the new bike.
-    if needBike then
+    -- Recheck car purchase after earning funds before buying a bike.
+    if not ensureCarCrate(token) then return false end
+    if needBike and not ownedTravelVehicle() then
         if not ensureBike(token) then return false end
         if not ownedTravelVehicle() then error("Bike not received: "..tostring(API.BikePurchaseStatus or API.LastWarning)) end
     end
@@ -3500,6 +3817,7 @@ end
 API.Snapshot = function()
     return {Level = API.Level, XP = API.FishingXP, Zone = API.ZoneName, Bait = API.BaitName,
         DesiredRod=API.DesiredRod,DesiredBait=API.DesiredBait,
+        CarCrateStatus=API.CarCrateStatus,CarCratePrice=API.CarCratePrice,CarCratesPurchased=API.CarCratesPurchased or 0,
         Fish = fishCount(), Inventory = Items.get_inventory_count(Data).hand, Capacity = capacity,
         Cash = cash(), Bank = bank(), Sold = API.Sold, Deposited = API.Deposited, Withdrawn = API.Withdrawn,
         LastSaleReason=API.LastSaleReason,LastSellSkip=API.LastSellSkip,
@@ -3671,7 +3989,9 @@ function API.Start()
                     if fishCount()>0 then if not sellFish(token,manualSale) then return end
                     elseif inventoryFull() then error("Inventory full of non-fish items") end
                 end
+                if not ensureCarCrate(token) then return end
                 if not ensureBike(token) then return end
+                if not API.ZoneSkill then selectZone() end
                 if not alive(token) or not prepareEquipment(token) then return end
                 if inventoryFull() then continue end
                 if (root.Position - API.Spot).Magnitude > 10 or (API.CenterFishing and not API.AtLakeCenter) then
@@ -3787,8 +4107,10 @@ function API.Destroy()
     destroyed = true
     for _, c in ipairs(connections) do c:Disconnect() end
     for _, hook in ipairs(dataHooks) do hook.unhook() end
-    if env.BlockSpinAutoFishing == API then env.BlockSpinAutoFishing = nil end
+    if env.BlockSpinAutoFishing == API then
+        if env.BlockSpinStatusUI then env.BlockSpinStatusUI.Destroy() end
+        env.BlockSpinAutoFishing = nil
+    end
 end
 logEvent("STARTUP","Initialization complete; Enabled="..tostring(Config.Enabled))
 if Config.Enabled then API.Start() end
-
