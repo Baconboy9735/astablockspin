@@ -1611,7 +1611,23 @@ local function tryOwnedTransport(token, destination)
     local refreshed=false
     local existingSeat=existing and existing:FindFirstChild("DriverSeat",true)
     local nearby=vehicleType=="car" and Config.CarNearbyDistance or Config.ScooterNearbyDistance
-    if existing and ((existingSeat and existingSeat.Position or existing:GetPivot().Position)-root.Position).Magnitude>nearby then
+    local parkedPosition=existing and (existingSeat and existingSeat.Position or existing:GetPivot().Position)
+    -- A parked car below the shore can be nearby in XZ but unreachable on foot.
+    local belowGround=false
+    if parkedPosition and vehicleType=="car" and h.SeatPart~=existingSeat then
+        local params=RaycastParams.new()
+        params.FilterType=Enum.RaycastFilterType.Include
+        params.FilterDescendantsInstances={workspace.Terrain,workspace.Map}
+        params.RespectCanCollide=true
+        params.IgnoreWater=true
+        local depth=root.Position.Y-parkedPosition.Y
+        if depth>6 then
+            local origin=Vector3.new(parkedPosition.X,root.Position.Y,parkedPosition.Z)
+            local floor=workspace:Raycast(origin,Vector3.new(0,-depth,0),params)
+            belowGround=floor~=nil and floor.Position.Y-parkedPosition.Y>3
+        end
+    end
+    if parkedPosition and ((parkedPosition-root.Position).Magnitude>nearby or belowGround) then
         local driver=existingSeat
         if driver and driver.Occupant and driver.Occupant~=h then API.LastTransportError="Owned scooter is occupied" return false end
         status("Despawning distant "..owned.name)
@@ -1653,8 +1669,11 @@ local function tryOwnedTransport(token, destination)
             local a,b=seat.Position+side,seat.Position-side
             approach=(a-root.Position).Magnitude<(b-root.Position).Magnitude and a or b
         end
-        local reached=walkingRoute(token,approach,"Running to owned "..owned.name)
-        if not reached then return false end
+        local reached,reason=walkingRoute(token,approach,"Running to owned "..owned.name)
+        if not reached then
+            API.LastTransportError="Cannot reach "..owned.name.." seat: "..tostring(reason or "approach failed")
+            return false
+        end
     end
     if h.SeatPart~=seat then fireproximityprompt(prompt) end
     local deadline=os.clock()+2
@@ -2564,7 +2583,7 @@ local function findCarCrate(token)
             if touch and touch:IsA("BasePart") then
                 for _,option in ipairs(folder:GetChildren()) do
                     local cost=option:GetAttribute("price")
-                    if option:IsA("ModuleScript") and option:GetAttribute("disabled")~=true and type(cost)=="number" and cost>0 then
+                    if option:IsA("ModuleScript") and option.Name:lower():find("elite",1,true) and option:GetAttribute("disabled")~=true and type(cost)=="number" and cost>0 then
                         local ok,definition=pcall(require,option)
                         if ok and type(definition)=="table" and (not definition.purchase_type or definition.purchase_type=="money") then
                             local entries=type(definition.items)=="table" and definition.items or {}
@@ -2921,7 +2940,9 @@ local function selectZone()
             API.LastWarning="Deep Sea requires the $2,500,000 fishing license"
         end
     end
-    if API.ZoneSkill == chosen.Skill and API.LastCenterMode==Config.FishFromLakeCenter and API.LastSkyMode==Config.SkyFishing then return end
+    local _,travelType=ownedTravelVehicle()
+    local skyMode=Config.SkyFishing and travelType=="car" and chosen.Skill~="DeepSeaIsland"
+    if API.ZoneSkill == chosen.Skill and API.LastCenterMode==Config.FishFromLakeCenter and API.LastSkyMode==skyMode then return end
     player:RequestStreamAroundAsync(chosen.Center,3)
     if chosen.Skill == "LilPond" then
         API.Spot, API.Water = Vector3.new(205.97638, 254.93259, -819.11719), Vector3.new(192.29074, 249.84375, -765.84711)
@@ -2946,11 +2967,10 @@ local function selectZone()
     end
     if not API.AtLakeCenter then clearLakeSupport() end
     API.Shore=shore
-    local _,travelType=ownedTravelVehicle()
-    API.SkyFishing=Config.SkyFishing and travelType=="car" and chosen.Skill~="DeepSeaIsland"
+    API.SkyFishing=skyMode
     API.CenterFishing=(Config.FishFromLakeCenter or API.SkyFishing) and chosen.Skill~="DeepSeaIsland"
     API.LastCenterMode=Config.FishFromLakeCenter
-    API.LastSkyMode=Config.SkyFishing
+    API.LastSkyMode=skyMode
     if API.CenterFishing then
         local center=API.Water
         local _,hum,root=character()
@@ -3401,7 +3421,7 @@ local function hasUsableRod()
     return found
 end
 local function starterChoices()
-    local rod,bait
+    local rod,bait,stock
     for _,unlock in ipairs(Unlocks) do
         local name=unlock.reward_info and unlock.reward_info.tool_name
         if name and Skills.has_skill(Data,"fishing",unlock.name) then
@@ -3412,13 +3432,15 @@ local function starterChoices()
                 if kind=="rod" and (not rod or (Config.AutoUpgradeRods and unlock.level>rod.Level) or (not Config.AutoUpgradeRods and cost<rod.Cost)) then
                     rod={Name=name,Cost=cost,Level=unlock.level}
                 end
-                if kind=="bait" and name~="Squidtec" and (not bait or unlock.level>bait.Level) then
-                    bait={Name=name,Cost=cost,Level=unlock.level,Ammo=Items.get_item_ammo_type(name)}
+                if kind=="bait" and name~="Squidtec" then
+                    local choice={Name=name,Cost=cost,Level=unlock.level,Ammo=Items.get_item_ammo_type(name)}
+                    if not bait or choice.Level>bait.Level then bait=choice end
+                    if baitAmount(choice.Ammo)>0 and (not stock or choice.Level<stock.Level) then stock=choice end
                 end
             end
         end
     end
-    return rod,bait
+    return rod,bait,stock
 end
 local function starterFunds()
     return cash()+(Config.AllowPurchaseWithdrawals and bank() or 0)
@@ -3636,9 +3658,9 @@ local function earnStarterFunds(token,target)
 end
 local function ensureStarterRod(token)
     if hasUsableRod() then API.EarningForRod=false API.Phase="Fishing" return true end
-    local rod,bait=starterChoices()
+    local rod,bait,stock=starterChoices()
     if not rod or not bait then error("Starter fishing rod/bait unlocks are unavailable") end
-    local neededBait=math.max(0,math.clamp(Config.StarterBaitAmount,1,50)-baitAmount(bait.Ammo))
+    local neededBait=stock and 0 or math.clamp(Config.StarterBaitAmount,1,50)
     local target=rod.Cost+neededBait*bait.Cost
     if starterFunds()<target then
         if not Config.BootstrapWithStocker then error("Insufficient starter funds; enable BootstrapWithStocker") end
@@ -3656,13 +3678,13 @@ local function ensureStartupKit(token)
     if not Config.PrepareFullKitOnStart then return ensureStarterRod(token) end
     if API.StartupKitReady and hasUsableRod() and (not Config.AutoBuyBike or ownedTravelVehicle()) then return true end
     if inventoryFull() and fishCount()>0 then if not sellFish(token) then return false end end
-    local rod,bait=starterChoices()
+    local rod,bait,stock=starterChoices()
     if not rod or not bait then error("Starter rod or bait definition is unavailable") end
-    if Config.ReuseExistingStartupKit and hasUsableRod() and (not Config.AutoBuyBike or ownedTravelVehicle()) and baitAmount(bait.Ammo)>0 then
+    if Config.ReuseExistingStartupKit and hasUsableRod() and (not Config.AutoBuyBike or ownedTravelVehicle()) and stock then
         API.StartupKitReady=true
         API.DesiredRod,API.DesiredBait=rod.Name,bait.Name
         API.Phase="Fishing"
-        logEvent("STARTUP","Reusing owned fishing kit; bait already available: "..bait.Name)
+        logEvent("STARTUP","Reusing owned fishing kit; bait already available: "..stock.Name)
         return true
     end
     local targetBait=math.clamp(Config.StarterBaitAmount,1,50)
@@ -3675,7 +3697,7 @@ local function ensureStartupKit(token)
         if not option then error("Bike shop case not available; will retry startup preparation") end
         bikeCost=price
     end
-    local baitToBuy=math.max(0,targetBait-baitAmount(bait.Ammo))
+    local baitToBuy=stock and 0 or targetBait
     API.DesiredRod,API.DesiredBait=rod.Name,bait.Name
     logEvent("BUY","Startup gear target: "..rod.Name.."; "..targetBait.." x "..bait.Name)
     local reserve=needBike and Config.BikePurchaseReserve or 0
@@ -3699,19 +3721,20 @@ local function ensureStartupKit(token)
         if not purchase(token,rod.Name,1,rod.Cost) then error("Could not purchase startup fishing rod") end
         if not waitFor(token,hasUsableRod,5) then error("Startup rod was not confirmed in inventory") end
     end
-    baitToBuy=math.max(0,targetBait-baitAmount(bait.Ammo))
+    stock=select(3,starterChoices())
+    baitToBuy=stock and 0 or targetBait
     if baitToBuy>0 then
         if not purchase(token,bait.Name,baitToBuy,baitToBuy*bait.Cost) then error("Could not purchase startup bait") end
         if not waitFor(token,function()return baitAmount(bait.Ammo)>=targetBait end,5) then error("Startup bait quantity not confirmed") end
     end
-    if not hasUsableRod() or (Config.AutoBuyBike and not ownedTravelVehicle()) or baitAmount(bait.Ammo)<targetBait then
+    if not hasUsableRod() or (Config.AutoBuyBike and not ownedTravelVehicle()) or (not stock and baitAmount(bait.Ammo)<targetBait) then
         error("Startup equipment changed before confirmation; rechecking requirements")
     end
     API.StartupKitReady=true
     API.StartupKitPlan.MissingFunds=0
     API.RetryCount=0
     API.Phase="Fishing"
-    logEvent("STARTUP","Equipment ready: bike, rod and "..targetBait.." bait")
+    logEvent("STARTUP","Equipment ready; using "..(stock and stock.Name or bait.Name))
     return true
 end
 
@@ -3745,12 +3768,12 @@ local function prepareEquipment(token)
     end
     if not desiredBait then error("No unlocked mainland bait found") end
     local existingName, existingAmmo
-    local existingLevel=-1
+    local existingLevel=math.huge
     for _,unlock in ipairs(Unlocks) do
         local name=unlock.reward_info and unlock.reward_info.tool_name
         if name and name~="Squidtec" and unlock.level<=API.Level then
             local model=Items.get_item_instance(name)
-            if model and model:GetAttribute("FishingItem")=="bait" and unlock.level>existingLevel then
+            if model and model:GetAttribute("FishingItem")=="bait" and unlock.level<existingLevel then
                 local ammoType=Items.get_item_ammo_type(name)
                 if baitAmount(ammoType)>0 then existingName,existingAmmo,existingLevel=name,ammoType,unlock.level end
             end
@@ -3762,15 +3785,11 @@ local function prepareEquipment(token)
         existingName,existingAmmo=baitAmount(squid)>0 and "Squidtec" or nil,baitAmount(squid)>0 and squid or nil
     end
     API.DesiredRod,API.DesiredBait=desiredRod,desiredBait
-    local desiredAmmo=Items.get_item_ammo_type(desiredBait)
-    if existingAmmo==desiredAmmo then
+    if existingAmmo then
         API.BaitName,API.BaitAmmo=existingName,existingAmmo
         return deposit(token)
     end
     local ammo = Items.get_item_ammo_type(desiredBait)
-    if existingAmmo and existingAmmo~=ammo then
-        logEvent("BUY","Bait upgrade: "..tostring(existingName).." -> "..desiredBait)
-    end
     if baitAmount(ammo) <= Config.BaitLowWater and not inventoryFull() then
         local price = Items.get_item_rarity_price(desiredBait)
         local tripAmount=Config.BaitPerTrip
@@ -4114,3 +4133,4 @@ function API.Destroy()
 end
 logEvent("STARTUP","Initialization complete; Enabled="..tostring(Config.Enabled))
 if Config.Enabled then API.Start() end
+
